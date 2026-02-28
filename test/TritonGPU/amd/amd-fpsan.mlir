@@ -114,3 +114,43 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %0 : tensor<4xf16>
   }
 }
+
+// -----
+
+#wmma = #ttg.amd_wmma<{version = 3, isTranspose = true, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 32]}>
+#wmma_dot_a = #ttg.dot_op<{opIdx = 0, parent = #wmma, kWidth = 8}>
+#wmma_dot_b = #ttg.dot_op<{opIdx = 1, parent = #wmma, kWidth = 8}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx1250", "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @dot_emulation_wmma
+  tt.func public @dot_emulation_wmma() -> tensor<16x16xf32, #wmma> {
+    // CHECK: scf.for
+    // CHECK-NOT: tt.dot
+    // CHECK-NOT: ttg.convert_layout
+    %cst = arith.constant 1.000000e+00 : f16
+    %zero = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #wmma>
+    %a = tt.splat %cst : f16 -> tensor<16x16xf16, #wmma_dot_a>
+    %b = tt.splat %cst : f16 -> tensor<16x16xf16, #wmma_dot_b>
+    %out = tt.dot %a, %b, %zero : tensor<16x16xf16, #wmma_dot_a> * tensor<16x16xf16, #wmma_dot_b> -> tensor<16x16xf32, #wmma>
+    tt.return %out : tensor<16x16xf32, #wmma>
+  }
+}
+
+// -----
+
+#mfma = #ttg.amd_mfma<{version = 3, warpsPerCTA = [4, 1], instrShape = [16, 16, 16], isTransposed = true}>
+#mfma_dot_a = #ttg.dot_op<{opIdx = 0, parent = #mfma, kWidth = 4}>
+#mfma_dot_b = #ttg.dot_op<{opIdx = 1, parent = #mfma, kWidth = 4}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @dot_emulation_mfma
+  tt.func public @dot_emulation_mfma() -> tensor<16x16xf32, #mfma> {
+    // CHECK: scf.for
+    // CHECK-NOT: tt.dot
+    // CHECK-NOT: ttg.convert_layout
+    %cst = arith.constant 1.000000e+00 : f16
+    %zero = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mfma>
+    %a = tt.splat %cst : f16 -> tensor<16x16xf16, #mfma_dot_a>
+    %b = tt.splat %cst : f16 -> tensor<16x16xf16, #mfma_dot_b>
+    %out = tt.dot %a, %b, %zero : tensor<16x16xf16, #mfma_dot_a> * tensor<16x16xf16, #mfma_dot_b> -> tensor<16x16xf32, #mfma>
+    tt.return %out : tensor<16x16xf32, #mfma>
+  }
+}

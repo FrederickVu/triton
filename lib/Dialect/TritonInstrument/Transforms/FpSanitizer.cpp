@@ -830,9 +830,12 @@ struct DotPattern : public OpRewritePattern<tt::DotOp> {
     int64_t tileM = std::min<int64_t>(kTileM, m);
     int64_t tileN = std::min<int64_t>(kTileN, n);
 
-    auto accLayout = cast<ttg::DistributedEncodingTrait>(cTy.getEncoding());
-    auto aLayout = cast<ttg::DistributedEncodingTrait>(aTy.getEncoding());
-    auto bLayout = cast<ttg::DistributedEncodingTrait>(bTy.getEncoding());
+    auto accLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+        rewriter, {tileM, tileN}, cTy.getElementType());
+    auto aLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+        rewriter, {tileM, k}, aTy.getElementType());
+    auto bLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+        rewriter, {k, tileN}, bTy.getElementType());
 
     auto accTileTy =
         RankedTensorType::get({tileM, tileN}, cTy.getElementType(), accLayout);
