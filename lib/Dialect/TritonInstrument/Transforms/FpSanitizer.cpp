@@ -412,7 +412,17 @@ Value castIntValueToType(PatternRewriter &rewriter, Location loc, Value v,
   return v;
 }
 
+
+Value zextToType(PatternRewriter &rewriter, Location loc, Value v,
+                 Type targetTy) {
+  if (v.getType() == targetTy)
+    return v;
+  return arith::ExtUIOp::create(rewriter, loc, targetTy, v);
+}
+
 Value bitcastToInt(PatternRewriter &rewriter, Location loc, Value v) {
+  if (isa<IntegerType>(getElementType(v.getType())))
+    return v;
   auto intTy = getIntTypeLike(v.getType());
   return tt::BitcastOp::create(rewriter, loc, intTy, v);
 }
@@ -566,30 +576,55 @@ Operation *storeScratchStrided2D(PatternRewriter &rewriter, Location loc,
 }
 
 Value emulateDotStep(PatternRewriter &rewriter, Location loc, Value aSlice,
-                     Value bSlice, int64_t m, int64_t n,
+                     Value bSlice, Value aScaleSlice, Value bScaleSlice,
+                     int64_t m, int64_t n,
                      ttg::DistributedEncodingTrait accLayout,
                      IntegerType accElem) {
   OpBuilder::InsertionGuard guard(rewriter);
   auto fullTy = RankedTensorType::get({m, n}, accElem, accLayout);
   auto aI = bitcastToInt(rewriter, loc, aSlice);
   auto bI = bitcastToInt(rewriter, loc, bSlice);
-  aI = castIntValueToType(rewriter, loc, aI,
-                          getTypeWithElement(aI.getType(), accElem));
-  bI = castIntValueToType(rewriter, loc, bI,
-                          getTypeWithElement(bI.getType(), accElem));
+  aI = zextToType(rewriter, loc, aI,
+                  getTypeWithElement(aI.getType(), accElem));
+  bI = zextToType(rewriter, loc, bI,
+                  getTypeWithElement(bI.getType(), accElem));
+  if (aScaleSlice) {
+    Value aScaleI = bitcastToInt(rewriter, loc, aScaleSlice);
+    aScaleI = zextToType(rewriter, loc, aScaleI,
+                         getTypeWithElement(aScaleI.getType(), accElem));
+    aI = arith::MulIOp::create(rewriter, loc, aI, aScaleI);
+  }
+  if (bScaleSlice) {
+    Value bScaleI = bitcastToInt(rewriter, loc, bScaleSlice);
+    bScaleI = zextToType(rewriter, loc, bScaleI,
+                         getTypeWithElement(bScaleI.getType(), accElem));
+    bI = arith::MulIOp::create(rewriter, loc, bI, bScaleI);
+  }
   Value aFull = tt::BroadcastOp::create(rewriter, loc, fullTy, aI);
   Value bFull = tt::BroadcastOp::create(rewriter, loc, fullTy, bI);
   return arith::MulIOp::create(rewriter, loc, aFull, bFull);
 }
 
-std::optional<scf::ForOp>
-emitMmaEmulationLoops(PatternRewriter &rewriter, Location loc, Value aPtr,
-                      Value bPtr, Value dPtr, int64_t m, int64_t n, int64_t k,
-                      int64_t tileM, int64_t tileN, RankedTensorType aTileTy,
-                      RankedTensorType bTileTy, RankedTensorType accTileTy,
-                      ttg::DistributedEncodingTrait accLayout,
-                      IntegerType accElem, Value useDInt, Value predInt,
-                      int64_t aStride, int64_t bStride, int64_t dStride) {
+struct DotScaleConfig {
+  Value aScalePtr;
+  Value bScalePtr;
+  RankedTensorType aScaleTileTy;
+  RankedTensorType bScaleTileTy;
+  int64_t aScaleStride = 0;
+  int64_t bScaleStride = 0;
+  int64_t aKPackFactor = 1;
+  int64_t bKPackFactor = 1;
+  int64_t aKPerScale = 0;
+  int64_t bKPerScale = 0;
+};
+
+std::optional<scf::ForOp> emitMmaEmulationLoops(
+    PatternRewriter &rewriter, Location loc, Value aPtr, Value bPtr, Value dPtr,
+    int64_t m, int64_t n, int64_t k, int64_t tileM, int64_t tileN,
+    RankedTensorType aTileTy, RankedTensorType bTileTy,
+    RankedTensorType accTileTy, ttg::DistributedEncodingTrait accLayout,
+    IntegerType accElem, Value useDInt, Value predInt, int64_t aStride,
+    int64_t bStride, int64_t dStride, const DotScaleConfig &scale = {}) {
   if ((m % tileM) != 0 || (n % tileN) != 0)
     return std::nullopt;
 
@@ -617,8 +652,8 @@ emitMmaEmulationLoops(PatternRewriter &rewriter, Location loc, Value aPtr,
   Value nIdxI32 = arith::IndexCastOp::create(rewriter, loc, i32Ty, nIdx);
   Value mConst =
       arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(m));
-  Value kConst =
-      arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(k));
+  Value bStrideConst = arith::ConstantOp::create(
+      rewriter, loc, rewriter.getI32IntegerAttr(bStride));
 
   Value nMulM = arith::MulIOp::create(rewriter, loc, nIdxI32, mConst);
   Value dOffset = arith::AddIOp::create(rewriter, loc, mIdxI32, nMulM);
@@ -630,7 +665,7 @@ emitMmaEmulationLoops(PatternRewriter &rewriter, Location loc, Value aPtr,
 
   Value aTilePtr =
       tt::AddPtrOp::create(rewriter, loc, aPtr.getType(), aPtr, mIdxI32);
-  Value bOffset = arith::MulIOp::create(rewriter, loc, nIdxI32, kConst);
+  Value bOffset = arith::MulIOp::create(rewriter, loc, nIdxI32, bStrideConst);
   Value bTilePtr =
       tt::AddPtrOp::create(rewriter, loc, bPtr.getType(), bPtr, bOffset);
 
@@ -650,17 +685,64 @@ emitMmaEmulationLoops(PatternRewriter &rewriter, Location loc, Value aPtr,
   rewriter.setInsertionPointToStart(kLoop.getBody());
   Value kIdx = kLoop.getInductionVar();
   Value kI32 = arith::IndexCastOp::create(rewriter, loc, i32Ty, kIdx);
-  Value aOffset = arith::MulIOp::create(rewriter, loc, i32Ty, kI32, aStrideVal);
+  Value aKIdx = kI32;
+  Value bKIdx = kI32;
+  if (scale.aKPackFactor > 1) {
+    Value aPackFactor = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(scale.aKPackFactor));
+    aKIdx = arith::DivUIOp::create(rewriter, loc, kI32, aPackFactor);
+  }
+  if (scale.bKPackFactor > 1) {
+    Value bPackFactor = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(scale.bKPackFactor));
+    bKIdx = arith::DivUIOp::create(rewriter, loc, kI32, bPackFactor);
+  }
+  Value aOffset =
+      arith::MulIOp::create(rewriter, loc, i32Ty, aKIdx, aStrideVal);
   Value aSlicePtr =
       tt::AddPtrOp::create(rewriter, loc, aPtr.getType(), aTilePtr, aOffset);
   Value aSlice =
       loadScratchStrided2D(rewriter, loc, aSlicePtr, aSliceTy, aStride);
   Value bSlicePtr =
-      tt::AddPtrOp::create(rewriter, loc, bPtr.getType(), bTilePtr, kI32);
+      tt::AddPtrOp::create(rewriter, loc, bPtr.getType(), bTilePtr, bKIdx);
   Value bSlice =
       loadScratchStrided2D(rewriter, loc, bSlicePtr, bSliceTy, bStride);
-  Value partial = emulateDotStep(rewriter, loc, aSlice, bSlice, tileM, tileN,
-                                 accLayout, accElem);
+  Value aScaleSlice;
+  if (scale.aScalePtr) {
+    Value aScaleTilePtr = tt::AddPtrOp::create(
+        rewriter, loc, scale.aScalePtr.getType(), scale.aScalePtr, mIdxI32);
+    Value aKPerScaleVal = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(scale.aKPerScale));
+    Value aScaleKGrp =
+        arith::DivUIOp::create(rewriter, loc, i32Ty, kI32, aKPerScaleVal);
+    Value aScaleStrideVal = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(scale.aScaleStride));
+    Value aScaleOffset = arith::MulIOp::create(rewriter, loc, i32Ty, aScaleKGrp,
+                                               aScaleStrideVal);
+    Value aScaleSlicePtr = tt::AddPtrOp::create(
+        rewriter, loc, scale.aScalePtr.getType(), aScaleTilePtr, aScaleOffset);
+    aScaleSlice = loadScratchStrided2D(rewriter, loc, aScaleSlicePtr,
+                                       scale.aScaleTileTy, scale.aScaleStride);
+  }
+  Value bScaleSlice;
+  if (scale.bScalePtr) {
+    Value bScaleTilePtr = tt::AddPtrOp::create(
+        rewriter, loc, scale.bScalePtr.getType(), scale.bScalePtr, nIdxI32);
+    Value bKPerScaleVal = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(scale.bKPerScale));
+    Value bScaleKGrp =
+        arith::DivUIOp::create(rewriter, loc, i32Ty, kI32, bKPerScaleVal);
+    Value bScaleStrideVal = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getI32IntegerAttr(scale.bScaleStride));
+    Value bScaleOffset = arith::MulIOp::create(rewriter, loc, i32Ty, bScaleKGrp,
+                                               bScaleStrideVal);
+    Value bScaleSlicePtr = tt::AddPtrOp::create(
+        rewriter, loc, scale.bScalePtr.getType(), bScaleTilePtr, bScaleOffset);
+    bScaleSlice = loadScratchStrided2D(rewriter, loc, bScaleSlicePtr,
+                                       scale.bScaleTileTy, /*stride1=*/1);
+  }
+  Value partial = emulateDotStep(rewriter, loc, aSlice, bSlice, aScaleSlice,
+                                 bScaleSlice, tileM, tileN, accLayout, accElem);
   Value acc = kLoop.getRegionIterArgs()[0];
   Value next = arith::AddIOp::create(rewriter, loc, acc, partial);
   scf::YieldOp::create(rewriter, loc, next);
@@ -852,6 +934,124 @@ struct DotPattern : public OpRewritePattern<tt::DotOp> {
         rewriter, loc, aPtr, bPtr, dPtr, m, n, k, tileM, tileN, aTileTy,
         bTileTy, accTileTy, accLayout, accElem, useDInt, predInt,
         /*aStride=*/m, /*bStride=*/k, /*dStride=*/m);
+    if (!mLoop)
+      return failure();
+    rewriter.setInsertionPointAfter(*mLoop);
+
+    Value out = loadScratchStrided2D(rewriter, loc, dPtr, cTy, /*stride1=*/m);
+    if (!out)
+      return failure();
+    rewriter.replaceOp(op, out);
+    return success();
+  }
+};
+
+struct DotScaledPattern : public OpRewritePattern<tt::DotScaledOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(tt::DotScaledOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!isFloatLike(op.getType()))
+      return failure();
+    auto aScale = op.getAScale();
+    auto bScale = op.getBScale();
+    auto aTy = dyn_cast<RankedTensorType>(op.getA().getType());
+    auto bTy = dyn_cast<RankedTensorType>(op.getB().getType());
+    auto cTy = dyn_cast<RankedTensorType>(op.getC().getType());
+    auto aScaleTy = aScale ? dyn_cast<RankedTensorType>(aScale.getType())
+                           : RankedTensorType();
+    auto bScaleTy = bScale ? dyn_cast<RankedTensorType>(bScale.getType())
+                           : RankedTensorType();
+    if (!aTy || !bTy || !cTy || (aScale && !aScaleTy) || (bScale && !bScaleTy))
+      return failure();
+    if (aTy.getRank() != 2 || bTy.getRank() != 2 || cTy.getRank() != 2 ||
+        (aScale && aScaleTy.getRank() != 2) ||
+        (bScale && bScaleTy.getRank() != 2))
+      return failure();
+    if (!aTy.getEncoding() || !bTy.getEncoding() || !cTy.getEncoding() ||
+        (aScale && !aScaleTy.getEncoding()) ||
+        (bScale && !bScaleTy.getEncoding()))
+      return failure();
+    // TODO: Support M/N packing.
+    if (!op.getLhsKPack() || !op.getRhsKPack())
+      return failure();
+
+    auto aShape = aTy.getShape();
+    auto bShape = bTy.getShape();
+    auto cShape = cTy.getShape();
+    if (aShape[0] != cShape[0] || bShape[1] != cShape[1])
+      return failure();
+
+    int64_t aKPackFactor = 1;
+    int64_t bKPackFactor = 1;
+    if (op.getAElemType() == tt::ScaleDotElemType::E2M1)
+      aKPackFactor = 2;
+    if (op.getBElemType() == tt::ScaleDotElemType::E2M1)
+      bKPackFactor = 2;
+    int64_t aPackedK = aShape[1];
+    int64_t bPackedK = bShape[0];
+    int64_t k = aPackedK * aKPackFactor;
+    if (k != bPackedK * bKPackFactor)
+      return failure();
+
+    auto loc = op.getLoc();
+    int64_t m = cShape[0];
+    int64_t n = cShape[1];
+    if ((aScale && aScaleTy.getShape()[0] != m) ||
+        (bScale && bScaleTy.getShape()[0] != n))
+      return failure();
+
+    auto accElem = IntegerType::get(
+        rewriter.getContext(), cTy.getElementType().getIntOrFloatBitWidth());
+    Value useDInt = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getIntegerAttr(accElem, 1));
+    Value predInt = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getIntegerAttr(accElem, 1));
+
+    int64_t tileM = std::min<int64_t>(kTileM, m);
+    int64_t tileN = std::min<int64_t>(kTileN, n);
+
+    auto accLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+        rewriter, {tileM, tileN}, cTy.getElementType());
+    auto aLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+        rewriter, {tileM, aPackedK}, aTy.getElementType());
+    auto bLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+        rewriter, {bPackedK, tileN}, bTy.getElementType());
+
+    auto accTileTy =
+        RankedTensorType::get({tileM, tileN}, cTy.getElementType(), accLayout);
+    auto aTileTy =
+        RankedTensorType::get({tileM, aPackedK}, aTy.getElementType(), aLayout);
+    auto bTileTy =
+        RankedTensorType::get({bPackedK, tileN}, bTy.getElementType(), bLayout);
+
+    auto aPtr = createScratchAndStore(rewriter, loc, op.getA(), aTy);
+    auto bPtr = createScratchAndStore(rewriter, loc, op.getB(), bTy);
+    auto dPtr = createScratchAndStore(rewriter, loc, op.getC(), cTy);
+
+    DotScaleConfig scale;
+    scale.aKPackFactor = aKPackFactor;
+    scale.bKPackFactor = bKPackFactor;
+    if (aScale) {
+      scale.aScalePtr = createScratchAndStore(rewriter, loc, aScale, aScaleTy);
+      scale.aScaleStride = aScaleTy.getShape()[0];
+      scale.aKPerScale =
+          isa<Float8E4M3FNType>(aScaleTy.getElementType()) ? 16 : 32;
+      scale.aScaleTileTy = RankedTensorType::get(
+          {tileM, 1}, aScaleTy.getElementType(), accLayout);
+    }
+    if (bScale) {
+      scale.bScalePtr = createScratchAndStore(rewriter, loc, bScale, bScaleTy);
+      scale.bScaleStride = bScaleTy.getShape()[0];
+      scale.bKPerScale =
+          isa<Float8E4M3FNType>(bScaleTy.getElementType()) ? 16 : 32;
+      scale.bScaleTileTy = RankedTensorType::get(
+          {1, tileN}, bScaleTy.getElementType(), accLayout);
+    }
+
+    auto mLoop = emitMmaEmulationLoops(
+        rewriter, loc, aPtr, bPtr, dPtr, m, n, k, tileM, tileN, aTileTy,
+        bTileTy, accTileTy, accLayout, accElem, useDInt, predInt,
+        /*aStride=*/m, /*bStride=*/bPackedK, /*dStride=*/m, scale);
     if (!mLoop)
       return failure();
     rewriter.setInsertionPointAfter(*mLoop);
@@ -1128,7 +1328,8 @@ public:
                  BinaryFloatToIntPattern<arith::SubFOp, arith::SubIOp>,
                  BinaryFloatToIntPattern<arith::MulFOp, arith::MulIOp>,
                  DivFOpPattern, PreciseDivFOpPattern, RemFOpPattern, FmaPattern,
-                 ExtFOpPattern, TruncFOpPattern, DotPattern>(&getContext());
+                 ExtFOpPattern, TruncFOpPattern, DotPattern, DotScaledPattern>(
+        &getContext());
     patterns.add<UnaryPattern<math::ExpOp>>(&getContext(), UnaryOpId::Exp);
     patterns.add<UnaryPattern<math::LogOp>>(&getContext(), UnaryOpId::Log);
     patterns.add<UnaryPattern<math::Exp2Op>>(&getContext(), UnaryOpId::Exp2);
