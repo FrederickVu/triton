@@ -10,6 +10,7 @@
 #include "triton/Dialect/TritonInstrument/Transforms/Passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include <cassert>
 
 namespace mlir {
@@ -874,6 +875,65 @@ struct TruncFOpPattern : public OpRewritePattern<arith::TruncFOp> {
   }
 };
 
+struct FpToFpPattern : public OpRewritePattern<tt::FpToFpOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(tt::FpToFpOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!isFloatLike(op.getType()))
+      return failure();
+    auto loc = op.getLoc();
+    auto inI = bitcastToInt(rewriter, loc, op.getSrc());
+    auto outI =
+        castIntValueToType(rewriter, loc, inI, getIntTypeLike(op.getType()));
+    auto outF = bitcastToFloat(rewriter, loc, outI, op.getType());
+    rewriter.replaceOp(op, outF);
+    return success();
+  }
+};
+
+struct Fp4ToFpPattern : public OpRewritePattern<ttg::Fp4ToFpOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(ttg::Fp4ToFpOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!isFloatLike(op.getType()))
+      return failure();
+    auto srcTy = dyn_cast<RankedTensorType>(op.getSrc().getType());
+    auto dstTy = dyn_cast<RankedTensorType>(op.getType());
+    if (!srcTy || !dstTy)
+      return failure();
+    auto srcElemTy = dyn_cast<IntegerType>(srcTy.getElementType());
+    if (!srcElemTy || srcElemTy.getWidth() != 8)
+      return failure();
+
+    int64_t axis = op.getAxis();
+    int64_t rank = srcTy.getRank();
+    auto dstIntTy = cast<RankedTensorType>(getIntTypeLike(dstTy));
+    auto halfIntTy = srcTy.clone(dstIntTy.getElementType());
+
+    auto loc = op.getLoc();
+    auto mask = getIntConstantLike(rewriter, loc, srcTy, 0x0F);
+    auto four = getIntConstantLike(rewriter, loc, srcTy, 4);
+    Value lo = arith::AndIOp::create(rewriter, loc, op.getSrc(), mask);
+    Value hi = arith::ShRUIOp::create(rewriter, loc, op.getSrc(), four);
+    auto loI = castIntValueToType(rewriter, loc, lo, halfIntTy);
+    auto hiI = castIntValueToType(rewriter, loc, hi, halfIntTy);
+    Value joined = tt::JoinOp::create(rewriter, loc, loI, hiI);
+
+    auto order = llvm::to_vector(llvm::seq<int32_t>(axis + 1));
+    order.push_back(rank);
+    llvm::append_range(order, llvm::seq<int32_t>(axis + 1, rank));
+    auto transposed = tt::TransOp::create(rewriter, loc, joined, order);
+
+    Value result =
+        tt::ReshapeOp::create(rewriter, loc, dstTy.getShape(), transposed);
+    if (result.getType() != dstIntTy)
+      result = ttg::ConvertLayoutOp::create(rewriter, loc, dstIntTy, result);
+
+    rewriter.replaceOp(op, bitcastToFloat(rewriter, loc, result, dstTy));
+    return success();
+  }
+};
+
 struct DotPattern : public OpRewritePattern<tt::DotOp> {
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(tt::DotOp op,
@@ -1328,7 +1388,8 @@ public:
                  BinaryFloatToIntPattern<arith::SubFOp, arith::SubIOp>,
                  BinaryFloatToIntPattern<arith::MulFOp, arith::MulIOp>,
                  DivFOpPattern, PreciseDivFOpPattern, RemFOpPattern, FmaPattern,
-                 ExtFOpPattern, TruncFOpPattern, DotPattern, DotScaledPattern>(
+                 ExtFOpPattern, TruncFOpPattern, FpToFpPattern, Fp4ToFpPattern,
+                 DotPattern, DotScaledPattern>(
         &getContext());
     patterns.add<UnaryPattern<math::ExpOp>>(&getContext(), UnaryOpId::Exp);
     patterns.add<UnaryPattern<math::LogOp>>(&getContext(), UnaryOpId::Log);
