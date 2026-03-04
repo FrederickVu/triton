@@ -174,6 +174,26 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 2], warpsPerCTA = [4, 1], order = [0, 1]}>
+#dot_A = #ttg.dot_op<{opIdx = 0, parent = #blocked}>
+#dot_B = #ttg.dot_op<{opIdx = 1, parent = #blocked}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.target" = "gfx950",  "ttg.threads-per-warp" = 64 : i32} {
+  // CHECK-LABEL: @dot_scaled_emulation
+  tt.func public @dot_scaled_emulation() -> tensor<16x16xf32, #blocked> {
+    // CHECK: scf.for
+    // CHECK-NOT: ttg.dot_scaled
+    // CHECK-NOT: ttg.convert_layout
+     %cst = arith.constant 1.000000e+00 : f16
+     %zero = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #blocked>
+     %a = tt.splat %cst : f16 -> tensor<16x16xf16, #dot_A>
+     %b = tt.splat %cst : f16 -> tensor<16x16xf16, #dot_B>
+     %out = tt.dot_scaled %a, %b, %zero lhs = fp16 rhs = fp16 {fastMath = false} : tensor<16x16xf16, #dot_A> * tensor<16x16xf16, #dot_B> -> tensor<16x16xf32, #blocked>
+     tt.return %out : tensor<16x16xf32, #blocked>
+  }
+}
+
+// -----
+
 // CHECK-LABEL: @binary_ops
 tt.func public @binary_ops(%a: tensor<4xf32>, %b: tensor<4xf32>) -> tensor<4xf32> {
   // CHECK: tt.bitcast

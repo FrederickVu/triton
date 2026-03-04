@@ -1,13 +1,16 @@
 # ruff: noqa: F821
 import numpy as np
 import pytest
+import hip
+# Needed for internal dev flow for now; will remove later
+hip.hip.hipInit(0)
 import torch
 
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton import language as tl
-from triton._internal_testing import is_blackwell, is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4, is_hip_gfx1250, is_interpreter
+from triton._internal_testing import is_blackwell, is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4, is_hip_gfx1250, is_interpreter, is_sm12x
 from triton.experimental.gluon.language.nvidia.blackwell import (TensorMemoryLayout, allocate_tensor_memory, mbarrier,
                                                                  tcgen05_mma)
 from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async_copy
@@ -518,6 +521,87 @@ def test_dot_fma(device, fresh_knobs):
 
     kernel[(1, )](aw, bw, cw, outw, THREADS_PER_WARP=THREADS_PER_WARP)
 
+    _assert_payload_equal(out, exp_bits)
+
+
+@pytest.mark.skipif(not (is_hip_cdna4() or is_hip_gfx1250() or is_sm12x()),
+                    reason="Requires native DotScaledOp (CDNA4, GFX1250, or SM120)")
+@pytest.mark.parametrize("type_a",["e2m1","e4m3","e5m2"])
+@pytest.mark.parametrize("type_b",["e2m1","e4m3","e5m2"])
+def test_dot_scaled(device, type_a, type_b, fresh_knobs):
+    _require_cuda_backend(device)
+
+    B = 32
+    K = 64
+    SCALE_K = K // 32
+
+    def allocator(size:int, alignment: int, stream):
+        return torch.empty(size, device="cuda", dtype=torch.int32)
+
+    triton.set_allocator(allocator)
+    fresh_knobs.compilation.instrumentation_mode = "fpsan"
+
+    @triton.jit
+    def kernel(a_ptr, a_scale_ptr, b_ptr, b_scale_ptr, out_ptr, BLOCK_M:tl.constexpr, BLOCK_N: tl.constexpr,
+               BLOCK_K: tl.constexpr, TYPE_A: tl.constexpr, TYPE_B: tl.constexpr):
+        DIV_FACTOR_A: tl.constexpr = 2 if TYPE_A == "e2m1" else 1
+        DIV_FACTOR_B : tl.constexpr = 2 if TYPE_B == "e2m1" else 1
+        PACKED_BLOCK_K_A: tl.constexpr = BLOCK_K // DIV_FACTOR_A
+        PACKED_BLOCK_K_B: tl.constexpr = BLOCK_K // DIV_FACTOR_B
+        SCALE_BLOCK_K: tl.constexpr = BLOCK_K // 32
+
+        offs_am = tl.arange(0, BLOCK_M)[:, None]
+        offs_bn = tl.arange(0, BLOCK_N)[None, :]
+        offs_ak = tl.arange(0, PACKED_BLOCK_K_A)[None, :]
+        offs_bk = tl.arange(0, PACKED_BLOCK_K_B)[:, None]
+
+        a = tl.load(a_ptr + offs_am * PACKED_BLOCK_K_A + offs_ak)
+        b = tl.load(b_ptr + offs_bk * BLOCK_N + offs_bn)
+
+        offs_scale_ak = tl.arange(0, SCALE_BLOCK_K)[None, :]
+        offs_scale_bk = tl.arange(0, SCALE_BLOCK_K)[None, :]
+        a_scale = tl.load(a_scale_ptr + offs_am * SCALE_BLOCK_K + offs_scale_ak)
+        b_scale = tl.load(b_scale_ptr + tl.arange(0, BLOCK_N)[:, None] * SCALE_BLOCK_K + offs_scale_bk)
+
+        c = tl.dot_scaled(a, a_scale, TYPE_A, b, b_scale, TYPE_B)
+        tl.store(out_ptr + offs_am * BLOCK_N + offs_bn, c)
+
+    a_pack = 2 if type_a == "e2m1" else 1
+    b_pack = 2 if type_b == "e2m1" else 1
+    packed_k_a = K // a_pack
+    packed_k_b = K // b_pack
+
+    rs = np.random.RandomState(1)
+    a_bits = rs.randint(0, 256, size=(B, packed_k_a)).astype(np.uint8)
+    b_bits = rs.randint(0, 256, size=(packed_k_b, B)).astype(np.uint8)
+    a_scale_bits = rs.randint(0, 256, size=(B, SCALE_K)).astype(np.uint8)
+    b_scale_bits = rs.randint(0, 256, size=(B, SCALE_K)).astype(np.uint8)
+
+    a = torch.tensor(a_bits, device="cuda", dtype=torch.uint8)
+    b = torch.tensor(b_bits, device="cuda", dtype=torch.uint8)
+    a_scale = torch.tensor(a_scale_bits, device="cuda", dtype=torch.uint8)
+    b_scale = torch.tensor(b_scale_bits, device="cuda", dtype=torch.uint8)
+
+    out = torch.empty((B, B), device="cuda", dtype=torch.int32)
+    outw = triton.TensorWrapper(out, dtype=torch.float32)
+
+    kernel[(1, )](a, a_scale, b, b_scale, outw, BLOCK_M=B, BLOCK_N=B, BLOCK_K=K, TYPE_A=type_a, TYPE_B=type_b)
+
+    mask = np.uint64(0xFFFFFFFF)
+    exp = np.zeros((B, B), dtype=np.uint64)
+    for i in range(B):
+        for j in range(B):
+            s = np.uint64(0)
+            for kk in range(K):
+                a_val = np.uint64(a_bits[i, kk // a_pack])
+                b_val = np.uint64(b_bits[kk // b_pack, j])
+                a_s = np.uint64(a_scale_bits[i, kk // 32])
+                b_s = np.uint64(b_scale_bits[j, kk // 32])
+                a_scaled = (a_val * a_s) & mask
+                b_scaled = (b_val * b_s) & mask
+                s = (s + a_scaled * b_scaled) & mask
+            exp[i, j] = s
+    exp_bits = exp.astype(np.uint32).view(np.int32)
     _assert_payload_equal(out, exp_bits)
 
 
