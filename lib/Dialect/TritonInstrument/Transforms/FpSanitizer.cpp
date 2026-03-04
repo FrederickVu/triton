@@ -67,6 +67,28 @@ constexpr uint64_t getUnaryOpId(UnaryOpId opId) {
 // Scratch memory management
 // ------------------------------------------------------------
 
+static ttg::BlockedEncodingAttr
+getOptimizedBlockedEncoding(PatternRewriter &rewriter, ArrayRef<int64_t> shape,
+                            Type elemType) {
+  int numWarps = ttg::lookupNumWarps(rewriter.getInsertionBlock()->getParent());
+  int threadsPerWarp = ttg::lookupThreadsPerWarp(rewriter);
+  int numCTAs = ttg::lookupNumCTAs(rewriter.getInsertionBlock()->getParentOp());
+  auto base = ttg::getDefaultBlockedEncoding(rewriter.getContext(), shape,
+                                             numWarps, threadsPerWarp, numCTAs);
+  SmallVector<unsigned> order = llvm::to_vector(base.getOrder());
+  SmallVector<unsigned> sizePerThread(shape.size(), 1);
+  unsigned elemBits = elemType.getIntOrFloatBitWidth();
+  unsigned maxElems = std::max(128u / elemBits, 1u);
+  if (!order.empty()) {
+    unsigned dim = order.front();
+    sizePerThread[dim] =
+        static_cast<unsigned>(std::min<int64_t>(shape[dim], maxElems));
+  }
+  return ttg::BlockedEncodingAttr::get(
+      rewriter.getContext(), sizePerThread, base.getThreadsPerWarp(),
+      base.getWarpsPerCTA(), order, base.getCGALayout());
+}
+
 struct ScratchInfo {
   Value ptr;
   RankedTensorType tensorType;
@@ -94,30 +116,6 @@ public:
       return arith::ExtSIOp::create(rewriter, loc, i32Ty, value);
     }
     return Value();
-  }
-
-  static ttg::BlockedEncodingAttr
-  getOptimizedBlockedEncoding(PatternRewriter &rewriter,
-                              ArrayRef<int64_t> shape, Type elemType) {
-    int numWarps =
-        ttg::lookupNumWarps(rewriter.getInsertionBlock()->getParent());
-    int threadsPerWarp = ttg::lookupThreadsPerWarp(rewriter);
-    int numCTAs =
-        ttg::lookupNumCTAs(rewriter.getInsertionBlock()->getParentOp());
-    auto base = ttg::getDefaultBlockedEncoding(
-        rewriter.getContext(), shape, numWarps, threadsPerWarp, numCTAs);
-    SmallVector<unsigned> order = llvm::to_vector(base.getOrder());
-    SmallVector<unsigned> sizePerThread(shape.size(), 1);
-    unsigned elemBits = elemType.getIntOrFloatBitWidth();
-    unsigned maxElems = std::max(128u / elemBits, 1u);
-    if (!order.empty()) {
-      unsigned dim = order.front();
-      sizePerThread[dim] =
-          static_cast<unsigned>(std::min<int64_t>(shape[dim], maxElems));
-    }
-    return ttg::BlockedEncodingAttr::get(
-        rewriter.getContext(), sizePerThread, base.getThreadsPerWarp(),
-        base.getWarpsPerCTA(), order, base.getCGALayout());
   }
 
   std::optional<ScratchInfo>
@@ -969,11 +967,11 @@ struct DotPattern : public OpRewritePattern<tt::DotOp> {
     int64_t tileM = std::min<int64_t>(kTileM, m);
     int64_t tileN = std::min<int64_t>(kTileN, n);
 
-    auto accLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+    auto accLayout = getOptimizedBlockedEncoding(
         rewriter, {tileM, tileN}, cTy.getElementType());
-    auto aLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+    auto aLayout = getOptimizedBlockedEncoding(
         rewriter, {tileM, k}, aTy.getElementType());
-    auto bLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+    auto bLayout = getOptimizedBlockedEncoding(
         rewriter, {k, tileN}, bTy.getElementType());
 
     auto accTileTy =
@@ -1067,11 +1065,11 @@ struct DotScaledPattern : public OpRewritePattern<tt::DotScaledOp> {
     int64_t tileM = std::min<int64_t>(kTileM, m);
     int64_t tileN = std::min<int64_t>(kTileN, n);
 
-    auto accLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+    auto accLayout = getOptimizedBlockedEncoding(
         rewriter, {tileM, tileN}, cTy.getElementType());
-    auto aLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+    auto aLayout = getOptimizedBlockedEncoding(
         rewriter, {tileM, aPackedK}, aTy.getElementType());
-    auto bLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+    auto bLayout = getOptimizedBlockedEncoding(
         rewriter, {bPackedK, tileN}, bTy.getElementType());
 
     auto accTileTy =
@@ -1295,15 +1293,15 @@ struct TCGen5MMAPattern : public OpRewritePattern<ttng::TCGen5MMAOp> {
     int64_t tileM = std::min<int64_t>(kTileM, m);
     int64_t tileN = std::min<int64_t>(kTileN, n);
 
-    auto accTileLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+    auto accTileLayout = getOptimizedBlockedEncoding(
         rewriter, {tileM, tileN}, dMemTy.getElementType());
     auto accTileTy = RankedTensorType::get(
         {tileM, tileN}, dMemTy.getElementType(), accTileLayout);
-    auto aTileLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+    auto aTileLayout = getOptimizedBlockedEncoding(
         rewriter, {tileM, k}, aMemTy.getElementType());
     auto aTileTy =
         RankedTensorType::get({tileM, k}, aMemTy.getElementType(), aTileLayout);
-    auto bTileLayout = TmemScratchManager::getOptimizedBlockedEncoding(
+    auto bTileLayout = getOptimizedBlockedEncoding(
         rewriter, {k, tileN}, bMemTy.getElementType());
     auto bTileTy =
         RankedTensorType::get({k, tileN}, bMemTy.getElementType(), bTileLayout);
