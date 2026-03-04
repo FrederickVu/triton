@@ -413,7 +413,6 @@ Value castIntValueToType(PatternRewriter &rewriter, Location loc, Value v,
   return v;
 }
 
-
 Value zextToType(PatternRewriter &rewriter, Location loc, Value v,
                  Type targetTy) {
   if (v.getType() == targetTy)
@@ -585,10 +584,8 @@ Value emulateDotStep(PatternRewriter &rewriter, Location loc, Value aSlice,
   auto fullTy = RankedTensorType::get({m, n}, accElem, accLayout);
   auto aI = bitcastToInt(rewriter, loc, aSlice);
   auto bI = bitcastToInt(rewriter, loc, bSlice);
-  aI = zextToType(rewriter, loc, aI,
-                  getTypeWithElement(aI.getType(), accElem));
-  bI = zextToType(rewriter, loc, bI,
-                  getTypeWithElement(bI.getType(), accElem));
+  aI = zextToType(rewriter, loc, aI, getTypeWithElement(aI.getType(), accElem));
+  bI = zextToType(rewriter, loc, bI, getTypeWithElement(bI.getType(), accElem));
   if (aScaleSlice) {
     Value aScaleI = bitcastToInt(rewriter, loc, aScaleSlice);
     aScaleI = zextToType(rewriter, loc, aScaleI,
@@ -1389,8 +1386,7 @@ public:
                  BinaryFloatToIntPattern<arith::MulFOp, arith::MulIOp>,
                  DivFOpPattern, PreciseDivFOpPattern, RemFOpPattern, FmaPattern,
                  ExtFOpPattern, TruncFOpPattern, FpToFpPattern, Fp4ToFpPattern,
-                 DotPattern, DotScaledPattern>(
-        &getContext());
+                 DotPattern, DotScaledPattern>(&getContext());
     patterns.add<UnaryPattern<math::ExpOp>>(&getContext(), UnaryOpId::Exp);
     patterns.add<UnaryPattern<math::LogOp>>(&getContext(), UnaryOpId::Log);
     patterns.add<UnaryPattern<math::Exp2Op>>(&getContext(), UnaryOpId::Exp2);

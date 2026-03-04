@@ -1,9 +1,6 @@
 # ruff: noqa: F821
 import numpy as np
 import pytest
-import hip
-# Needed for internal dev flow for now; will remove later
-hip.hip.hipInit(0)
 import torch
 
 import triton
@@ -526,8 +523,8 @@ def test_dot_fma(device, fresh_knobs):
 
 @pytest.mark.skipif(not (is_hip_cdna4() or is_hip_gfx1250() or is_sm12x()),
                     reason="Requires native DotScaledOp (CDNA4, GFX1250, or SM120)")
-@pytest.mark.parametrize("type_a",["e2m1","e4m3","e5m2"])
-@pytest.mark.parametrize("type_b",["e2m1","e4m3","e5m2"])
+@pytest.mark.parametrize("type_a", ["e2m1", "e4m3", "e5m2"])
+@pytest.mark.parametrize("type_b", ["e2m1", "e4m3", "e5m2"])
 def test_dot_scaled(device, type_a, type_b, fresh_knobs):
     _require_cuda_backend(device)
 
@@ -535,17 +532,17 @@ def test_dot_scaled(device, type_a, type_b, fresh_knobs):
     K = 64
     SCALE_K = K // 32
 
-    def allocator(size:int, alignment: int, stream):
+    def allocator(size: int, alignment: int, stream):
         return torch.empty(size, device="cuda", dtype=torch.int32)
 
     triton.set_allocator(allocator)
     fresh_knobs.compilation.instrumentation_mode = "fpsan"
 
     @triton.jit
-    def kernel(a_ptr, a_scale_ptr, b_ptr, b_scale_ptr, out_ptr, BLOCK_M:tl.constexpr, BLOCK_N: tl.constexpr,
+    def kernel(a_ptr, a_scale_ptr, b_ptr, b_scale_ptr, out_ptr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                BLOCK_K: tl.constexpr, TYPE_A: tl.constexpr, TYPE_B: tl.constexpr):
         DIV_FACTOR_A: tl.constexpr = 2 if TYPE_A == "e2m1" else 1
-        DIV_FACTOR_B : tl.constexpr = 2 if TYPE_B == "e2m1" else 1
+        DIV_FACTOR_B: tl.constexpr = 2 if TYPE_B == "e2m1" else 1
         PACKED_BLOCK_K_A: tl.constexpr = BLOCK_K // DIV_FACTOR_A
         PACKED_BLOCK_K_B: tl.constexpr = BLOCK_K // DIV_FACTOR_B
         SCALE_BLOCK_K: tl.constexpr = BLOCK_K // 32
@@ -810,7 +807,7 @@ def test_async_buffer_copy(device, fresh_knobs):
     np.testing.assert_array_equal(out.cpu().numpy().astype(np.int16, copy=False), x_bits)
 
 
-@pytest.mark.skipif(not is_hip_gfx1250(),reason="Requires gfx1250")
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires gfx1250")
 def test_tdm_copy(device, fresh_knobs):
     _require_cuda_backend(device)
 
@@ -819,9 +816,8 @@ def test_tdm_copy(device, fresh_knobs):
     @gluon.jit
     def kernel(x_ptr, out_ptr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr):
         shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
-        x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(base=x_ptr, shape=(BLOCK_M, BLOCK_N),
-                                                           strides=(BLOCK_N, 1), block_shape=(BLOCK_M, BLOCK_N),
-                                                           layout=shared)
+        x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(base=x_ptr, shape=(BLOCK_M, BLOCK_N), strides=(BLOCK_N, 1),
+                                                           block_shape=(BLOCK_M, BLOCK_N), layout=shared)
         smem = gl.allocate_shared_memory(x_ptr.dtype.element_ty, [BLOCK_M, BLOCK_N], shared)
         gl.amd.gfx1250.tdm.async_load(x_desc, [0, 0], smem)
         gl.amd.gfx1250.tdm.async_wait(0)
@@ -831,7 +827,7 @@ def test_tdm_copy(device, fresh_knobs):
                                                              layout=shared)
         gl.amd.gfx1250.tdm.async_store(out_desc, [0, 0], smem)
         gl.amd.gfx1250.tdm.async_wait(0)
-    
+
     block_m = 16
     block_n = 16
     rs = np.random.RandomState(37)
@@ -843,5 +839,5 @@ def test_tdm_copy(device, fresh_knobs):
     xw = triton.TensorWrapper(x, dtype=torch.float16)
     outw = triton.TensorWrapper(out, dtype=torch.float16)
     kernel[(1, )](xw, outw, BLOCK_M=block_m, BLOCK_N=block_n, num_warps=1)
-    
+
     np.testing.assert_array_equal(out.cpu().numpy().astype(np.int16, copy=False), x_bits)
