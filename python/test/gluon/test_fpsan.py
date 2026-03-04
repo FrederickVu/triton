@@ -10,6 +10,7 @@ from triton import language as tl
 from triton._internal_testing import is_blackwell, is_cuda, is_hip, is_hip_cdna3, is_hip_cdna4, is_hip_gfx1250, is_interpreter
 from triton.experimental.gluon.language.nvidia.blackwell import (TensorMemoryLayout, allocate_tensor_memory, mbarrier,
                                                                  tcgen05_mma)
+from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async_copy
 
 THREADS_PER_WARP = triton.runtime.driver.active.get_current_target().warp_size
 
@@ -686,3 +687,77 @@ def test_reduction(device, fresh_knobs):
     reduce_kernel[(1, )](a, c1, M=M, N=N, stride_am=a.stride(0), stride_ak=a.stride(1), ORDER=0)
     reduce_kernel[(1, )](a, c2, M=M, N=N, stride_am=a.stride(0), stride_ak=a.stride(1), ORDER=1)
     assert _payload_equal(c1, c2)
+
+
+@pytest.mark.skipif(not is_hip_cdna4(), reason="Requires CDNA4")
+def test_async_buffer_copy(device, fresh_knobs):
+    _require_cuda_backend(device)
+
+    fresh_knobs.compilation.instrumentation_mode = "fpsan"
+
+    @gluon.jit
+    def kernel(x_ptr, out_ptr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr):
+        blocked: gl.constexpr = gl.BlockedLayout([1, 8], [32, 2], [4, 1], [1, 0])
+        shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+        smem = gl.allocate_shared_memory(x_ptr.dtype.element_ty, [BLOCK_M, BLOCK_N], shared)
+
+        offs_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, blocked))[:, None]
+        offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked))[None, :]
+        offs = offs_m * BLOCK_N + offs_n
+
+        cdna4_async_copy.buffer_load_to_shared(smem, x_ptr, offs)
+        cdna4_async_copy.commit_group()
+        cdna4_async_copy.wait_group(0)
+        x = cdna4_async_copy.load_shared_relaxed(smem, blocked)
+        gl.store(out_ptr + offs, x)
+
+    block_m = 128
+    block_n = 16
+    rs = np.random.RandomState(37)
+    x_bits = rs.randint(-(2**15), 2**15, size=(block_m, block_n), dtype=np.int16)
+
+    x = torch.tensor(x_bits, device="cuda", dtype=torch.int16)
+    out = torch.empty((block_m, block_n), device="cuda", dtype=torch.int16)
+
+    xw = triton.TensorWrapper(x, dtype=torch.float16)
+    outw = triton.TensorWrapper(out, dtype=torch.float16)
+    kernel[(1, )](xw, outw, BLOCK_M=block_m, BLOCK_N=block_n, num_warps=4)
+
+    np.testing.assert_array_equal(out.cpu().numpy().astype(np.int16, copy=False), x_bits)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(),reason="Requires gfx1250")
+def test_tdm_copy(device, fresh_knobs):
+    _require_cuda_backend(device)
+
+    fresh_knobs.compilation.instrumentation_mode = "fpsan"
+
+    @gluon.jit
+    def kernel(x_ptr, out_ptr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr):
+        shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+        x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(base=x_ptr, shape=(BLOCK_M, BLOCK_N),
+                                                           strides=(BLOCK_N, 1), block_shape=(BLOCK_M, BLOCK_N),
+                                                           layout=shared)
+        smem = gl.allocate_shared_memory(x_ptr.dtype.element_ty, [BLOCK_M, BLOCK_N], shared)
+        gl.amd.gfx1250.tdm.async_load(x_desc, [0, 0], smem)
+        gl.amd.gfx1250.tdm.async_wait(0)
+
+        out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(base=out_ptr, shape=(BLOCK_M, BLOCK_N),
+                                                             strides=(BLOCK_N, 1), block_shape=(BLOCK_M, BLOCK_N),
+                                                             layout=shared)
+        gl.amd.gfx1250.tdm.async_store(out_desc, [0, 0], smem)
+        gl.amd.gfx1250.tdm.async_wait(0)
+    
+    block_m = 16
+    block_n = 16
+    rs = np.random.RandomState(37)
+    x_bits = rs.randint(-(2**15), 2**15, size=(block_m, block_n), dtype=np.int16)
+
+    x = torch.tensor(x_bits, device="cuda", dtype=torch.int16)
+    out = torch.empty((block_m, block_n), device="cuda", dtype=torch.int16)
+
+    xw = triton.TensorWrapper(x, dtype=torch.float16)
+    outw = triton.TensorWrapper(out, dtype=torch.float16)
+    kernel[(1, )](xw, outw, BLOCK_M=block_m, BLOCK_N=block_n, num_warps=1)
+    
+    np.testing.assert_array_equal(out.cpu().numpy().astype(np.int16, copy=False), x_bits)
