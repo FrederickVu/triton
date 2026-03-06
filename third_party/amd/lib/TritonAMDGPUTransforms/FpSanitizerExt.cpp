@@ -22,30 +22,6 @@ namespace {
 // Utility functions
 // ------------------------------------------------------------
 
-Value decodeE8M0ToFloat(PatternRewriter &rewriter, Location loc, Value scale,
-                        FloatType dstElemTy) {
-  auto scaleTy = cast<RankedTensorType>(scale.getType());
-  // f16 can't represent E8M0's range. Use f32 to decode then cast.
-  FloatType decodeTy = dstElemTy.isF16() ? rewriter.getF32Type() : dstElemTy;
-  int width = decodeTy.getIntOrFloatBitWidth();
-  int shift = decodeTy.getFPMantissaWidth() - 1;
-  auto intTy = rewriter.getIntegerType(width);
-  auto intTensorTy = scaleTy.clone(intTy);
-
-  auto zext = arith::ExtUIOp::create(rewriter, loc, intTensorTy, scale);
-  auto shiftConst =
-      arith::ConstantIntOp::create(rewriter, loc, shift, width);
-  auto shiftVec =
-      tt::SplatOp::create(rewriter, loc, intTensorTy, shiftConst);
-  auto shl = arith::ShLIOp::create(rewriter, loc, zext, shiftVec);
-  Value result =
-      tt::BitcastOp::create(rewriter, loc, scaleTy.clone(decodeTy), shl);
-  if (decodeTy != dstElemTy)
-    result = tt::FpToFpOp::create(rewriter, loc, scaleTy.clone(dstElemTy),
-                                  result);
-  return result;
-}
-
 Value convertScaleElemType(PatternRewriter &rewriter, Location loc, Value scale,
                            FloatType dstElemTy) {
   auto scaleTy = cast<RankedTensorType>(scale.getType());
@@ -53,16 +29,19 @@ Value convertScaleElemType(PatternRewriter &rewriter, Location loc, Value scale,
   if (elemTy == dstElemTy)
     return scale;
   if (isa<FloatType>(elemTy))
-    return tt::FpToFpOp::create(rewriter, loc, scaleTy.clone(dstElemTy),
-                                scale);
-  if (isa<IntegerType>(elemTy))
-    return decodeE8M0ToFloat(rewriter, loc, scale, dstElemTy);
+    return tt::FpToFpOp::create(rewriter, loc, scaleTy.clone(dstElemTy), scale);
+  if (isa<IntegerType>(elemTy)) {
+    unsigned dstWidth = dstElemTy.getIntOrFloatBitWidth();
+    auto intTy = rewriter.getIntegerType(dstWidth);
+    auto intTensorTy = scaleTy.clone(intTy);
+    auto ext = arith::ExtUIOp::create(rewriter, loc, intTensorTy, scale);
+    return tt::BitcastOp::create(rewriter, loc, scaleTy.clone(dstElemTy), ext);
+  }
   return {};
 }
 
-Value
-convertScaleToType(PatternRewriter &rewriter, Location loc,
-                  Value scale, RankedTensorType dstTy) {
+Value convertScaleToType(PatternRewriter &rewriter, Location loc, Value scale,
+                         RankedTensorType dstTy) {
   auto dstElemTy = cast<FloatType>(dstTy.getElementType());
   auto scaled = convertScaleElemType(rewriter, loc, scale, dstElemTy);
   if (!scaled)
@@ -76,8 +55,8 @@ convertScaleToType(PatternRewriter &rewriter, Location loc,
 // Patterns
 //----------------------------------------
 
-struct ScaledUpcastFp8OpPattern :
-    public OpRewritePattern<amdgpu::ScaledUpcastFp8Op> {
+struct ScaledUpcastFp8OpPattern
+    : public OpRewritePattern<amdgpu::ScaledUpcastFp8Op> {
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(amdgpu::ScaledUpcastFp8Op op,
                                 PatternRewriter &rewriter) const override {
@@ -97,8 +76,8 @@ struct ScaledUpcastFp8OpPattern :
   }
 };
 
-struct ScaledUpcastFp4OpPattern :
-    public OpRewritePattern<amdgpu::ScaledUpcastFp4Op> {
+struct ScaledUpcastFp4OpPattern
+    : public OpRewritePattern<amdgpu::ScaledUpcastFp4Op> {
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(amdgpu::ScaledUpcastFp4Op op,
                                 PatternRewriter &rewriter) const override {
@@ -107,8 +86,8 @@ struct ScaledUpcastFp4OpPattern :
     auto dstElemTy = dstTy.getElementType();
     Type upcastElemTy = dstElemTy.isF32() ? rewriter.getBF16Type() : dstElemTy;
 
-    Value upcasted = ttg::Fp4ToFpOp::create(
-        rewriter, loc, op.getInput(), upcastElemTy, op.getAxis());
+    Value upcasted = ttg::Fp4ToFpOp::create(rewriter, loc, op.getInput(),
+                                            upcastElemTy, op.getAxis());
     if (upcastElemTy != dstElemTy) {
       auto ty = cast<RankedTensorType>(upcasted.getType()).clone(dstElemTy);
       upcasted = tt::FpToFpOp::create(rewriter, loc, ty, upcasted);
@@ -128,8 +107,8 @@ struct ScaledUpcastFp4OpPattern :
 };
 
 void populateAmdFpSanPatterns(RewritePatternSet &patterns) {
-  patterns.add<ScaledUpcastFp4OpPattern,
-               ScaledUpcastFp8OpPattern>(patterns.getContext());
+  patterns.add<ScaledUpcastFp4OpPattern, ScaledUpcastFp8OpPattern>(
+      patterns.getContext());
 }
 
 class TritonAMDGPUFpSanitizerExtPass
