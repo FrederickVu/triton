@@ -243,11 +243,39 @@ Value shuffleIdx(Location loc, RewriterBase &rewriter, Value val, Value i,
                        b.i32_val(0x1f));
 }
 
+// Convert a 16-bit nibble selector to a 32-bit byte selector for v_perm_b32.
+static uint32_t nibbleToByteSel(uint32_t nibSel) {
+  uint32_t byteSel = 0;
+  for (int i = 0; i < 4; ++i)
+    byteSel |= ((nibSel >> (4 * i)) & 0xF) << (8 * i);
+  return byteSel;
+}
+
 Value permute(Location loc, RewriterBase &rewriter, Value x, Value y,
               Value selector) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
+
+  // Pre-compute byte selectors when input is select(pred, const, const).
+  if (auto selOp = selector.getDefiningOp<LLVM::SelectOp>()) {
+    auto trueC = selOp.getTrueValue().getDefiningOp<LLVM::ConstantOp>();
+    auto falseC = selOp.getFalseValue().getDefiningOp<LLVM::ConstantOp>();
+    if (trueC && falseC) {
+      uint32_t tVal =
+          (uint32_t)cast<IntegerAttr>(trueC.getValue()).getValue().getZExtValue();
+      uint32_t fVal =
+          (uint32_t)cast<IntegerAttr>(falseC.getValue()).getValue().getZExtValue();
+      Value byteSel = b.select(selOp.getCondition(),
+                               b.i32_val(nibbleToByteSel(tVal)),
+                               b.i32_val(nibbleToByteSel(fVal)));
+      Value args[] = {x, y, byteSel};
+      return createLLVMIntrinsicCallOp(rewriter, loc, "llvm.amdgcn.perm",
+                                       i32_ty, args)
+          .getResult(0);
+    }
+  }
+
+  // Fallback: runtime nibble-to-byte conversion.
   Value prmt_mask = selector;
-  // convert from nybble mask to byte mask:
   prmt_mask =
       b.or_(b.and_(prmt_mask, b.i32_val(0x000000ff)),
             b.shl(b.and_(prmt_mask, b.i32_val(0x0000ff00)), b.i32_val(8)));
@@ -255,9 +283,9 @@ Value permute(Location loc, RewriterBase &rewriter, Value x, Value y,
       b.or_(b.and_(prmt_mask, b.i32_val(0x000f000f)),
             b.shl(b.and_(prmt_mask, b.i32_val(0x00f000f0)), b.i32_val(4)));
   Value args[] = {x, y, prmt_mask};
-  auto op = createLLVMIntrinsicCallOp(rewriter, loc, "llvm.amdgcn.perm", i32_ty,
-                                      args);
-  return op.getResult(0);
+  return createLLVMIntrinsicCallOp(rewriter, loc, "llvm.amdgcn.perm", i32_ty,
+                                   args)
+      .getResult(0);
 }
 
 // Utility function that returns flags <volatile, nontemporal> for a predicated

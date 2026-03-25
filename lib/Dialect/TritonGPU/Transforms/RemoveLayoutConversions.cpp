@@ -202,7 +202,7 @@ bool isLayoutAnchor(Operation *op) {
     return true;
   if (isa<LoadOp, StoreOp>(op))
     return isExpensiveLoadOrStore(op);
-  if (isa<DotOp, DotScaledOp, nvidia_gpu::WarpGroupDotOp, AtomicRMWOp,
+  if (isa<DotOp, DotScaledOp, nvidia_gpu::WarpGroupDotOp,
           AtomicCASOp, triton::nvidia_gpu::TMEMLoadOp>(op))
     return true;
   if (auto gatherOp = dyn_cast<GatherOp>(op))
@@ -365,7 +365,7 @@ void LayoutPropagation::resolveConflicts() {
     // TODO: add a proper heuristic.
     Attribute encoding = *info.encodings.begin();
     bool isLoadOrStore =
-        op && isa<LoadOp, StoreOp, AtomicRMWOp, AtomicCASOp>(op);
+        op && isa<LoadOp, StoreOp, AtomicCASOp>(op);
     for (Attribute e : info.encodings) {
       if ((isLoadOrStore && isa<BlockedEncodingAttr>(e)) ||
           (!isLoadOrStore && isa<MmaEncodingTrait>(e))) {
@@ -641,8 +641,8 @@ void LayoutPropagation::rewriteOp(Operation *op) {
     } else if (op->hasTrait<OpTrait::SameOperandsAndResultEncoding>() ||
                op->hasTrait<OpTrait::Elementwise>() ||
                isa<ReduceOp, ExpandDimsOp, ReshapeOp, TransOp, JoinOp, SplitOp,
-                   GatherOp, ConvertLayoutOp, nvidia_gpu::WarpGroupDotWaitOp>(
-                   op)) {
+                   GatherOp, ConvertLayoutOp, nvidia_gpu::WarpGroupDotWaitOp,
+                   DotOp>(op)) {
       rewriteGenericOpInPlace(op, encoding);
     } else {
       llvm::report_fatal_error("unexpected op in rewrite");
@@ -650,11 +650,28 @@ void LayoutPropagation::rewriteOp(Operation *op) {
   }
 }
 
-bool canBeRemat(Operation *op) {
+bool canBeRemat(Operation *op, Attribute targetEncoding = {}) {
   if (isa<LoadOp, StoreOp>(op))
     return !isExpensiveLoadOrStore(op);
-  if (isa<AtomicRMWOp, AtomicCASOp, DotOp>(op))
+  if (isa<AtomicRMWOp, AtomicCASOp>(op))
     return false;
+  // Allow DotOp remat when the target is the same MFMA family (only
+  // isTransposed differs). This enables backward-remat of the
+  // convert_layout(#mma_true → #mma_false) inserted by ConvertToBufferOps.
+  if (isa<DotOp>(op)) {
+    if (!targetEncoding)
+      return false;
+    auto resultTy = cast<RankedTensorType>(op->getResult(0).getType());
+    auto srcEnc = dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(
+        resultTy.getEncoding());
+    auto dstEnc =
+        dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(targetEncoding);
+    if (!srcEnc || !dstEnc)
+      return false;
+    return srcEnc.getVersion() == dstEnc.getVersion() &&
+           srcEnc.getWarpsPerCTA() == dstEnc.getWarpsPerCTA() &&
+           srcEnc.getInstrShape() == dstEnc.getInstrShape();
+  }
   if (auto gather = dyn_cast<GatherOp>(op))
     return !gather.getEfficientLayout();
 
@@ -922,7 +939,9 @@ LogicalResult LayoutRematerialization::getRematerializableSlice(
   // Check if all the operations in the slice can be rematerialized.
   for (Value v : slice) {
     if (Operation *op = v.getDefiningOp()) {
-      if (!canBeRemat(op))
+      // Pass target encoding so DotOp remat can check same-MFMA-family.
+      Attribute targetEnc = layout.count(v) ? layout[v] : rootEncoding;
+      if (!canBeRemat(op, targetEnc))
         return failure();
     }
   }

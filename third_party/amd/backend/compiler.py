@@ -290,6 +290,9 @@ class HIPBackend(BaseBackend):
                 knobs.amd.buffer_ops_analyze_small_tensor_range,
             )
             amd.passes.ttgpuir.add_optimize_buffer_op_ptr(pm)
+            # RLC pass to backward-remat convert_layout(#mma_true → #mma_false)
+            # inserted by ConvertToBufferOps for atomics with insufficient vec.
+            passes.ttgpuir.add_remove_layout_conversions(pm)
 
         amd.passes.ttgpuir.add_fold_true_cmpi(pm)
         amd.passes.ttgpuir.add_prepare_if_combining(pm)

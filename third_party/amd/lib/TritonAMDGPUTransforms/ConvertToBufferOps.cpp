@@ -376,6 +376,25 @@ struct ConvertTritonAtomicRMWOpToBufferAtomicRMW
     if (auto mask = op.getMask()) {
       vecSize = std::min(vecSize, axisAnalysisPass.getMaskAlignment(mask));
     }
+    // BENCH: If MFMA isTransposed=true with bf16/f16, we'll convert to
+    // isTransposed=false before the buffer_atomic (see below), which gives
+    // contigPerThread >= 2. Override vecSize to allow the conversion.
+    bool willFlipTranspose = false;
+    const char *atomicTransposeEnv = ::getenv("TRITON_ATOMIC_TRANSPOSE");
+    bool keepTransposed = atomicTransposeEnv &&
+                          std::string(atomicTransposeEnv) == "true";
+    if (!keepTransposed && vecSize < 2 &&
+        (checkType.isF16() || checkType.isBF16())) {
+      if (auto valTy = dyn_cast<RankedTensorType>(op.getVal().getType())) {
+        if (auto mfmaEnc = dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(
+                valTy.getEncoding())) {
+          if (mfmaEnc.getIsTransposed()) {
+            vecSize = 2; // will be achieved after isTransposed flip/swap
+            willFlipTranspose = true;
+          }
+        }
+      }
+    }
     // f16/bf16 dtypes could only be efficiently calculated using instructions
     // that pack 2 elements (e.g. @llvm.amdgcn.raw.buffer.atomic.fadd.v2f16)
     if (vecSize % 2 != 0 && (checkType.isF16() || checkType.isBF16())) {
@@ -429,13 +448,121 @@ struct ConvertTritonAtomicRMWOpToBufferAtomicRMW
       return rewriter.notifyMatchFailure(op, "RMW requires opBitWidth >= 32");
     }
 
+    // If val has MFMA isTransposed=true with bf16/f16, convert operands
+    // to enable vec>=2 for packed buffer atomics.
+    //
+    // TRITON_ATOMIC_LAYOUT=swap (default): Convert to a swapped LinearEncoding
+    //   via Ship (r0,l0) transposition. Good coalescence + packed atomics.
+    //
+    // TRITON_ATOMIC_LAYOUT=flip: Convert to #mma(isTransposed=false). A
+    //   subsequent RLC pass backward-remats this through to the dot, flipping
+    //   just the feeding dot's isTransposed. Poor coalescence but no Ship cost.
+    Value finalVal = op.getVal();
+    Value finalOffset = tensorOffset;
+    Value finalMask = op.getMask();
+
+    if (auto valTy = dyn_cast<RankedTensorType>(finalVal.getType())) {
+      if (auto mfmaEnc =
+              dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(valTy.getEncoding())) {
+        if (mfmaEnc.getIsTransposed()) {
+          auto ctx = mfmaEnc.getContext();
+          // TRITON_ATOMIC_TRANSPOSE controls atomic encoding when the dot
+          // result has isTransposed=true and vec < 2 for bf16/f16:
+          //   not set  → (r0,l0) basis swap: good coalescence + packed atomics
+          //   "true"   → keep #mma(isTransposed=true) as-is: no conversion,
+          //              vec=1 → scalar global atomics with DPP pairing
+          //   "false"  → convert to #mma(isTransposed=false): no conversion
+          //              overhead after RLC backward-remats through the dot,
+          //              but poor coalescence (few lane bits along contiguous dim)
+          const char *transposeEnv = ::getenv("TRITON_ATOMIC_TRANSPOSE");
+          if (transposeEnv) {
+            std::string transposeStr(transposeEnv);
+            if (transposeStr == "true") {
+              // Keep isTransposed=true: skip conversion entirely. The atomic
+              // stays in #mma(true) with vec=1, which fails the bf16 alignment
+              // check below → falls to global atomics with DPP pairing.
+            } else if (transposeStr == "false") {
+              // Convert to #mma(isTransposed=false). The subsequent RLC pass
+              // backward-remats this through the feeding dot.
+              Attribute targetEnc = triton::gpu::AMDMfmaEncodingAttr::get(
+                  ctx, mfmaEnc.getVersion(), mfmaEnc.getWarpsPerCTA(),
+                  mfmaEnc.getInstrShape(), /*isTransposed=*/false,
+                  mfmaEnc.getCGALayout(), mfmaEnc.getTilesPerWarp());
+
+              auto cvt = [&](Value v) -> Value {
+                auto ty = cast<RankedTensorType>(v.getType());
+                auto newTy = RankedTensorType::get(ty.getShape(),
+                                                   ty.getElementType(), targetEnc);
+                return triton::gpu::ConvertLayoutOp::create(
+                    rewriter, op->getLoc(), newTy, v);
+              };
+
+              finalVal = cvt(finalVal);
+              finalOffset = cvt(finalOffset);
+              if (finalMask)
+                finalMask = cvt(finalMask);
+            }
+          } else {
+            // Default: Ship (r0,l0) swap to LinearEncoding
+            auto shape = valTy.getShape();
+            auto ll = triton::gpu::toLinearEncoding(mfmaEnc, shape)
+                          .getLinearLayout();
+            auto regName = StringAttr::get(ctx, "register");
+            auto laneName = StringAttr::get(ctx, "lane");
+            auto &allBases = ll.getBases();
+
+            std::vector<std::vector<int32_t>> regBases, laneBases;
+            SmallVector<
+                std::pair<StringAttr, std::vector<std::vector<int32_t>>>>
+                newBases;
+            for (auto &[name, bases] : allBases) {
+              if (name == regName)
+                regBases = bases;
+              else if (name == laneName)
+                laneBases = bases;
+              else
+                newBases.push_back({name, bases});
+            }
+
+            if (!regBases.empty() && !laneBases.empty())
+              std::swap(regBases[0], laneBases[0]);
+
+            SmallVector<
+                std::pair<StringAttr, std::vector<std::vector<int32_t>>>>
+                finalBases;
+            finalBases.push_back({regName, regBases});
+            finalBases.push_back({laneName, laneBases});
+            finalBases.append(newBases.begin(), newBases.end());
+
+            auto outDims = ll.getOutDims();
+            LinearLayout swappedLL(finalBases, outDims,
+                                   /*requireSurjective=*/false);
+            Attribute targetEnc = triton::gpu::LinearEncodingAttr::get(ctx, swappedLL);
+
+            auto cvt = [&](Value v) -> Value {
+              auto ty = cast<RankedTensorType>(v.getType());
+              auto newTy = RankedTensorType::get(ty.getShape(),
+                                                 ty.getElementType(), targetEnc);
+              return triton::gpu::ConvertLayoutOp::create(
+                  rewriter, op->getLoc(), newTy, v);
+            };
+
+            finalVal = cvt(finalVal);
+            finalOffset = cvt(finalOffset);
+            if (finalMask)
+              finalMask = cvt(finalMask);
+          }
+        }
+      }
+    }
+
     Value maybeMask{};
-    if (op.getMask() && !isSplatOneConstTensor(op.getMask()))
-      maybeMask = op.getMask();
-    Value blockStride = getBlockStride(op->getLoc(), tensorOffset, rewriter);
+    if (finalMask && !isSplatOneConstTensor(finalMask))
+      maybeMask = finalMask;
+    Value blockStride = getBlockStride(op->getLoc(), finalOffset, rewriter);
     rewriter.replaceOpWithNewOp<triton::amdgpu::BufferAtomicRMWOp>(
-        op, op.getVal().getType(), atomicRmwOp, basePtr, tensorOffset,
-        op.getVal(), blockStride, sem, scope, maybeMask);
+        op, finalVal.getType(), atomicRmwOp, basePtr, finalOffset,
+        finalVal, blockStride, sem, scope, maybeMask);
 
     return success();
   }

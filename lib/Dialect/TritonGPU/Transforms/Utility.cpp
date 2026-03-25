@@ -941,6 +941,24 @@ LogicalResult getConvertBackwardSlice(
         if (auto upcast =
                 dyn_cast<triton::gpu::UpcastFpOpInterface>(definingOp)) {
           srcEncoding = upcast.inferSrcEncoding(i, encoding);
+        } else if (auto dot = dyn_cast<triton::DotOp>(definingOp)) {
+          // DotOp: operand 2 (acc) gets the result encoding;
+          // operands 0,1 (A,B) get DotOperandEncoding with new parent.
+          if (i == 2) {
+            srcEncoding = encoding;
+          } else {
+            auto opTy = cast<RankedTensorType>(operand.get().getType());
+            if (auto dotOpEnc = dyn_cast<triton::gpu::DotOperandEncodingAttr>(
+                    opTy.getEncoding())) {
+              auto mfmaEnc =
+                  dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(encoding);
+              if (mfmaEnc) {
+                srcEncoding = triton::gpu::DotOperandEncodingAttr::get(
+                    dot->getContext(), dotOpEnc.getOpIdx(), mfmaEnc,
+                    dotOpEnc.getKWidth());
+              }
+            }
+          }
         } else {
           srcEncoding = inferSrcEncoding(definingOp, encoding);
         }
