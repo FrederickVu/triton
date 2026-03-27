@@ -22,12 +22,17 @@
  */
 
 #include "TritonAMDGPUTransforms/Passes.h"
+#include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "third_party/amd/include/Analysis/AxisInfoExt.h"
+#include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Tools/LinearLayout.h"
 
 namespace mlir {
 
@@ -197,6 +202,114 @@ public:
   }
 };
 
+bool hasTransposedXmmaLayout(RankedTensorType ty) {
+  auto enc = ty.getEncoding();
+  bool isTransposed = false;
+  if (auto mfmaEnc = dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(enc))
+    isTransposed = mfmaEnc.getIsTransposed();
+  else if (auto wmmaEnc = dyn_cast<triton::gpu::AMDWmmaEncodingAttr>(enc))
+    isTransposed = wmmaEnc.getIsTransposed();
+
+  return isTransposed;
+}
+
+std::optional<triton::LinearLayout>
+chooseNewAtomicSinkLayout(RankedTensorType srcTy,
+                          triton::AxisInfo *ptrAxisInfo) {
+  auto contig = ptrAxisInfo->getContiguity();
+  auto order = getOrderFromContiguity(contig);
+  if (order[0] != 0 || !hasTransposedXmmaLayout(srcTy))
+    return std::nullopt;
+
+  auto *ctx = srcTy.getContext();
+  auto srcLL = triton::gpu::toLinearLayout(srcTy);
+  auto kReg = StringAttr::get(ctx, "register");
+  auto kLane = StringAttr::get(ctx, "lane");
+  auto newBases = srcLL.getBases();
+  std::swap(newBases[kReg][0], newBases[kLane][0]);
+  auto outDimNames = llvm::to_vector(srcLL.getOutDimNames());
+  return triton::LinearLayout(std::move(newBases), outDimNames);
+}
+
+void relayoutAtomicChain(triton::AtomicRMWOp atomicOp,
+                         triton::gpu::ConvertLayoutOp cvtOp,
+                         ArrayRef<Operation *> chainedOps, Attribute newEnc,
+                         PatternRewriter &rewriter) {
+  auto loc = atomicOp.getLoc();
+  cvtOp.getResult().setType(
+      cast<RankedTensorType>(cvtOp.getResult().getType())
+          .cloneWithEncoding(newEnc));
+
+  for (auto *op : llvm::reverse(chainedOps)) {
+    auto oldTy = cast<RankedTensorType>(op->getResult(0).getType());
+    op->getResult(0).setType(oldTy.cloneWithEncoding(newEnc));
+  }
+
+  auto ptrTy = cast<RankedTensorType>(atomicOp.getPtr().getType());
+  Value newPtr = triton::gpu::ConvertLayoutOp::create(
+      rewriter, loc, ptrTy.cloneWithEncoding(newEnc), atomicOp.getPtr());
+  atomicOp.getPtrMutable().assign(newPtr);
+
+  if (atomicOp.getMask()) {
+    auto maskTy = cast<RankedTensorType>(atomicOp.getMask().getType());
+    Value newMask = triton::gpu::ConvertLayoutOp::create(
+        rewriter, loc, maskTy.cloneWithEncoding(newEnc), atomicOp.getMask());
+    atomicOp.getMaskMutable().assign(newMask);
+  }
+
+  atomicOp.getResult().setType(
+      cast<RankedTensorType>(atomicOp.getResult().getType())
+          .cloneWithEncoding(newEnc));
+}
+
+class RelayoutAtomicSink
+    : public mlir::OpRewritePattern<triton::AtomicRMWOp> {
+public:
+  RelayoutAtomicSink(MLIRContext *context,
+                     triton::AMD::ModuleAxisInfoAnalysis &axisInfo)
+      : mlir::OpRewritePattern<triton::AtomicRMWOp>(context),
+        axisInfo(axisInfo) {}
+
+  // If bf16/fp16 atomic add is a sink and is downstream of mfma/wmma encoding
+  // along single-use chain of layout-preserving ops, and the mma encoding
+  // lacks vectorization along contiguous dimension, then rewrite chain and
+  // atomic with vectorized encoding using a cheap ConvertLayoutOp.
+  mlir::LogicalResult
+  matchAndRewrite(triton::AtomicRMWOp op,
+                  mlir::PatternRewriter &rewriter) const override {
+    if (!op.getResult().use_empty())
+      return mlir::failure();
+    if (op.getAtomicRmwOp() != triton::RMWOp::FADD)
+      return mlir::failure();
+
+    auto elemTy = getElementTypeOrSelf(op.getVal());
+    if (!elemTy.isF16() && !elemTy.isBF16())
+      return mlir::failure();
+
+    SmallVector<Operation *> chainedOps;
+    auto root = peelOneUseUnaryElementwiseOps(op.getVal(), chainedOps);
+    auto cvtOp = root.getDefiningOp<triton::gpu::ConvertLayoutOp>();
+    if (!cvtOp || !cvtOp.getResult().hasOneUse())
+      return mlir::failure();
+
+    auto *ptrAxisInfo = axisInfo.getAxisInfo(op.getPtr());
+    if (!ptrAxisInfo)
+      return mlir::failure();
+    auto newLL = chooseNewAtomicSinkLayout(
+        cast<RankedTensorType>(cvtOp.getSrc().getType()), ptrAxisInfo);
+    if (!newLL)
+      return mlir::failure();
+
+    auto newEnc = triton::gpu::LinearEncodingAttr::get(op->getContext(),
+                                                       std::move(*newLL));
+    relayoutAtomicChain(op, cvtOp, chainedOps, newEnc, rewriter);
+    return mlir::success();
+  }
+
+private:
+  triton::AMD::ModuleAxisInfoAnalysis &axisInfo;
+};
+
 } // anonymous namespace
 
 class TritonAMDGPUOptimizeEpiloguePass
@@ -208,9 +321,12 @@ public:
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
 
+    triton::AMD::ModuleAxisInfoAnalysis axisInfo(m);
+
     mlir::RewritePatternSet patterns(context);
 
     patterns.add<BypassEpilogueSMEM>(context);
+    patterns.add<RelayoutAtomicSink>(context, axisInfo);
 
     if (applyPatternsGreedily(m, std::move(patterns)).failed()) {
       signalPassFailure();

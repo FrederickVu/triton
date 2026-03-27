@@ -39,4 +39,9 @@ composePaddedLayout(const triton::AMD::TargetInfo &targetInfo, int opIdx,
                     triton::gpu::DotOperandEncodingAttr dotOpEnc = {},
                     bool useAsyncCopy = false);
 
+// Collects one-use, unary, pure, elementwise ops along a chain upstream of
+// `value`. Returns the first Value produced by an op that does not qualify.
+Value peelOneUseUnaryElementwiseOps(Value value,
+                                    SmallVector<Operation *> &peeledOps);
+
 #endif

@@ -10,6 +10,15 @@
 namespace tt = triton;
 namespace ttg = triton::gpu;
 
+namespace {
+
+bool isUnaryPureElementwiseOp(Operation *op) {
+  return op->getNumOperands() == 1 && op->getNumResults() == 1 &&
+         op->hasTrait<OpTrait::Elementwise>() && isMemoryEffectFree(op);
+}
+
+} // namespace
+
 namespace deduceMin {
 int deduceMinCountInBlock(Block &block,
                           const std::function<int(Operation *)> &countFunc);
@@ -480,4 +489,15 @@ composePaddedLayout(const tt::AMD::TargetInfo &targetInfo, int opIdx,
   }
 
   return {};
+}
+
+Value peelOneUseUnaryElementwiseOps(Value value,
+                                    SmallVector<Operation *> &peeledOps) {
+  while (Operation *defOp = value.getDefiningOp()) {
+    if (!(defOp->hasOneUse() && isUnaryPureElementwiseOp(defOp)))
+      break;
+    peeledOps.push_back(defOp);
+    value = defOp->getOperand(0);
+  }
+  return value;
 }
