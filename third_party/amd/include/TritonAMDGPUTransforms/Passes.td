@@ -263,6 +263,17 @@ def TritonAMDGPUInThreadTranspose: Pass<"tritonamdgpu-in-thread-transpose", "mli
   let dependentDialects = ["mlir::triton::amdgpu::TritonAMDGPUDialect", "mlir::triton::gpu::TritonGPUDialect"];
 }
 
+def TritonAMDGPUCoalesceAtomic : Pass<"tritonamdgpu-coalesce-atomic", "mlir::ModuleOp"> {
+  let summary = "Optimize atomic layouts for coalescing";
+
+  let description = [{
+    Re-encodes AtomicRMW ops so that per-thread vectorization does not exceed max(32, elemBitwidth) bits per thread,
+    as atomic instructions on AMD do not support greater vectorization.
+  }];
+
+  let dependentDialects = [];
+}
+
 def TritonAMDGPUCoalesceAsyncCopy: Pass<"tritonamdgpu-coalesce-async-copy", "mlir::ModuleOp"> {
   let summary = "Improve coalescing for async global to local copies";
 
