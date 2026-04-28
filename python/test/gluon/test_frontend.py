@@ -2868,6 +2868,83 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
 """)
 
 
+@pytest.mark.parametrize("target", [HIP_TARGET_CDNA4])
+def test_amd_local_load_packed_transposed(target):
+
+    @gluon.jit
+    def kernel():
+        mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(4, [32, 32, 16], True, [1, 1])
+        packed_rhs_layout: ttgl.constexpr = ttgl.DotOperandLayout(1, mfma_layout, 16)
+        shared: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+
+        smem = ttgl.allocate_shared_memory(ttgl.uint8, [128, 32], shared)
+        value = ttgl.amd.cdna4.local_load_packed_transposed(smem, packed_rhs_layout)
+        ttgl.static_assert(value.shape == [64, 64])
+
+    module = run_parser(kernel, *make_args(num_warps=1), target=target)
+    expecttest.assert_expected_inline(
+        anonymize_ir(module.str_nodebug()), """\
+#mma = #ttg.amd_mfma<{version = 4, warpsPerCTA = [1, 1], instrShape = [32, 32, 16], isTransposed = true}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.target = "...", "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @kernel() attributes {noinline = false} {
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<128x32xi8, #shared, #smem, mutable>
+    %1 = amdg.local_load_packed_transposed %0 : !ttg.memdesc<128x32xi8, #shared, #smem, mutable> -> tensor<64x64xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>
+    tt.return
+  }
+}
+""")
+
+
+@pytest.mark.parametrize("target", [HIP_TARGET_GFX1250])
+def test_amd_wmma_local_load_packed_transposed(target):
+
+    @gluon.jit
+    def kernel():
+        wmma_layout_packed: ttgl.constexpr = ttgl.amd.AMDWMMALayout(3, False, [[0, 1], [1, 0]], [], [16, 16, 64])
+        packed_rhs_layout: ttgl.constexpr = ttgl.DotOperandLayout(1, wmma_layout_packed, 16)
+        shared: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+
+        smem = ttgl.allocate_shared_memory(ttgl.uint8, [128, 32], shared)
+        value = ttgl.amd.gfx1250.local_load_packed_transposed(smem, packed_rhs_layout)
+        ttgl.static_assert(value.shape == [64, 64])
+
+    module = run_parser(kernel, *make_args(num_warps=4), target=target)
+    expecttest.assert_expected_inline(
+        anonymize_ir(module.str_nodebug()), """\
+#mma = #ttg.amd_wmma<{version = 3, isTranspose = false, ctaLayout = {warp = [[0, 1], [1, 0]]}, instrShape = [16, 16, 64]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @kernel() attributes {noinline = false} {
+    %0 = ttg.local_alloc : () -> !ttg.memdesc<128x32xi8, #shared, #smem, mutable>
+    %1 = amdg.local_load_packed_transposed %0 : !ttg.memdesc<128x32xi8, #shared, #smem, mutable> -> tensor<64x64xi8, #ttg.dot_op<{opIdx = 1, parent = #mma, kWidth = 16}>>
+    tt.return
+  }
+}
+""")
+
+
+@pytest.mark.parametrize("target", [HIP_TARGET_GFX1250])
+def test_amd_local_load_packed_transposed_requires_inferred_shape(target):
+
+    @gluon.jit
+    def kernel():
+        wmma_layout_packed: ttgl.constexpr = ttgl.amd.AMDWMMALayout(3, False, [[0, 1], [1, 0]], [], [16, 16, 64])
+        packed_rhs_layout: ttgl.constexpr = ttgl.DotOperandLayout(1, wmma_layout_packed, 16)
+        shared: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+
+        smem = ttgl.allocate_shared_memory(ttgl.uint8, [128, 32], shared)
+        ttgl.amd.gfx1250.local_load_packed_transposed(smem, packed_rhs_layout, shape=[128, 64])
+
+    with pytest.raises(CompilationError) as e:
+        run_parser(kernel, *make_args(num_warps=4), target=target)
+
+    err = str(e.value.__cause__ or e.value)
+    assert "Expected result shape for local_load_packed_transposed to be [64, 64] but got [128, 64]" in err
+
+
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA3, HIP_TARGET_CDNA4], ids=["cdna3", "cdna4"])
 def test_amd_scaled_upcast_fp4_cdna(target):
     scaled_upcast = _get_amd_scaled_upcast(target)

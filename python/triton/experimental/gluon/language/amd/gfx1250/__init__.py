@@ -2,7 +2,7 @@ from triton.runtime.jit import constexpr_function
 from triton._C.libtriton.gluon_ir import get_amd_wmma_scale_layout as _get_wmma_scale_layout
 
 from ..._core import builtin, int8, uint8, int32, float8e4nv, tensor, _unwrap_if_constexpr
-from .._ops import _wmma, _verify_wmma, _mma_scaled, _scaled_upcast
+from .._ops import _local_load_packed_transposed, _wmma, _verify_wmma, _mma_scaled, _scaled_upcast
 from .._layouts import AMDWMMALayout
 from ..cdna3 import buffer_load, buffer_store
 from ._layouts import PartitionedSharedLayout
@@ -12,8 +12,9 @@ from . import mbarrier
 from . import cluster
 
 __all__ = [
-    "async_copy", "tdm", "mbarrier", "cluster", "wmma", "wmma_scaled", "scaled_upcast", "buffer_load", "buffer_store",
-    "get_wmma_scale_layout", "PartitionedSharedLayout"
+    "async_copy", "tdm", "mbarrier", "cluster", "wmma", "wmma_scaled", "scaled_upcast",
+    "local_load_packed_transposed", "buffer_load", "buffer_store", "get_wmma_scale_layout",
+    "PartitionedSharedLayout"
 ]
 
 
@@ -122,6 +123,16 @@ def scaled_upcast(src, scale, elem_type, axis=None, _semantic=None):
     assert scale.dtype in (int8, uint8), \
         f"Expected scale to use raw E8M0 payload in int8/uint8 but got {scale.dtype}"
     return _scaled_upcast(src, scale, elem_type, axis, _semantic)
+
+
+@builtin
+def local_load_packed_transposed(mem_desc, layout, shape=None, _semantic=None):
+    """
+    Load M/N-packed fp4 bytes from shared memory into a K-packed WMMA dot operand layout.
+    """
+    layout = _unwrap_if_constexpr(layout)
+    shape = _unwrap_if_constexpr(shape)
+    return _local_load_packed_transposed(mem_desc, layout, shape, _semantic, parent_types=(AMDWMMALayout, ))
 
 
 def _get_wmma_scale_layout_impl(*args, **kwargs):

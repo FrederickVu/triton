@@ -4,13 +4,16 @@ from triton._C.libtriton.gluon_ir import get_amd_mfma_scale_layout as _get_mfma_
 from ..._core import builtin, int8, uint8, _unwrap_if_constexpr
 from ..._layouts import DotOperandLayout
 from .._layouts import AMDMFMALayout
-from .._ops import _mma_scaled, _scaled_upcast
+from .._ops import _local_load_packed_transposed, _mma_scaled, _scaled_upcast
 from ..cdna3 import _buffer_atomic_rmw_impl, _convert_e8m0_scale_to_bf16
 from ..cdna3 import *  # NOQA: F403
 from ..cdna3 import __all__ as __cdna3_all
 from . import async_copy
 
-__all__ = [*__cdna3_all, "async_copy", "mfma_scaled", "scaled_upcast", "get_mfma_scale_layout"]
+__all__ = [
+    *__cdna3_all, "async_copy", "mfma_scaled", "scaled_upcast", "local_load_packed_transposed",
+    "get_mfma_scale_layout"
+]
 
 
 @builtin
@@ -67,6 +70,21 @@ def scaled_upcast(src, scale, elem_type, axis=None, _semantic=None):
         f"Expected scale to use raw E8M0 payload in int8/uint8 but got {scale.dtype}"
     scale = _convert_e8m0_scale_to_bf16(scale, _semantic=_semantic)
     return _scaled_upcast(src, scale, elem_type, axis, _semantic)
+
+
+@builtin
+def local_load_packed_transposed(mem_desc, layout, shape=None, _semantic=None):
+    """
+    Load M/N-packed fp4 bytes from shared memory into a K-packed MFMA dot operand layout.
+
+    The source shared memory descriptor must contain `int8` or `uint8` packed fp4
+    values in a `SwizzledSharedLayout`. If `shape` is not provided, the
+    destination shape is inferred from the source shape and dot operand index in
+    `layout`.
+    """
+    layout = _unwrap_if_constexpr(layout)
+    shape = _unwrap_if_constexpr(shape)
+    return _local_load_packed_transposed(mem_desc, layout, shape, _semantic, parent_types=(AMDMFMALayout, ))
 
 
 def _get_mfma_scale_layout_impl(*args, **kwargs):

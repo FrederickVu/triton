@@ -572,6 +572,81 @@ chooseDotDsReadTrLayout(DotOperandEncodingAttr dotMfmaLayout,
   return combineCtaCgaWithShape(ctaLayout, mfmaLayout.getCGALayout(), shape);
 }
 
+std::optional<LinearLayout>
+chooseWmmaDotDsReadTrLayout(DotOperandEncodingAttr dotWmmaLayout,
+                            ArrayRef<int64_t> shape, int32_t elemBitWidth,
+                            unsigned instBitWidth,
+                            unsigned numLanesInShuffleGroup) {
+  if (instBitWidth != 64 || numLanesInShuffleGroup != 8)
+    return std::nullopt;
+  auto wmmaLayout =
+      llvm::dyn_cast<AMDWmmaEncodingAttr>(dotWmmaLayout.getParent());
+  if (!wmmaLayout || wmmaLayout.getVersion() != 3)
+    return std::nullopt;
+
+  assert(elemBitWidth == 4);
+
+  auto instrShape = wmmaLayout.getInstrShape();
+  if (instrShape[2] != 64 || dotWmmaLayout.getKWidth() != 16)
+    return std::nullopt;
+
+  unsigned opIdx = dotWmmaLayout.getOpIdx();
+  unsigned nonKDim = opIdx == 0 ? instrShape[0] : instrShape[1];
+  if (nonKDim != 16 && nonKDim != 32)
+    return std::nullopt;
+
+  auto rank = shape.size();
+  bool hasBatchDim = rank == 3;
+  auto kDim = opIdx == 0 ? rank - 1 : rank - 2;
+  int32_t kSize = shape[kDim];
+
+  MLIRContext *ctx = dotWmmaLayout.getContext();
+  SmallVector<StringAttr> outDimNames = standardOutDimNames(ctx, rank);
+
+  StringAttr kRegister = S("register");
+  StringAttr kLane = S("lane");
+
+  // The source is packed along the non-K dimension, so use [nonK, K] order.
+  SmallVector<unsigned> order =
+      getOrderForDotOperand(opIdx, rank, /*kContig*/ false);
+
+  std::vector<std::vector<int32_t>> registerBase;
+  std::vector<std::vector<int32_t>> laneBase;
+
+  // Each GFX1250 ds_load_tr4_b64 reads eight contiguous i8 values per lane.
+  // Those are bytes along the non-K dimension before the instruction changes
+  // the fp4 packing to the K dimension.
+  for (int32_t elem = 1; elem < static_cast<int32_t>(nonKDim / 2);
+       elem *= 2)
+    registerBase.push_back({elem, 0});
+
+  registerBase.push_back({0, 16});
+  for (int32_t reg = 64; reg < kSize; reg *= 2)
+    registerBase.push_back({0, reg});
+
+  laneBase.push_back({0, 1});
+  laneBase.push_back({0, 2});
+  laneBase.push_back({0, 4});
+  laneBase.push_back({0, 8});
+  laneBase.push_back({0, 32});
+
+  LinearLayout tileLayout({{kRegister, registerBase}, {kLane, laneBase}},
+                          {outDimNames[order[0]], outDimNames[order[1]]});
+  if (hasBatchDim) {
+    assert(order[2] == 0);
+    tileLayout *= LinearLayout::identity1D(1, kRegister, outDimNames[order[2]]);
+    tileLayout *= LinearLayout::identity1D(1, kLane, outDimNames[order[2]]);
+  }
+
+  auto ctaLayout = wmmaLayout.getCtaLayout();
+  ctaLayout = projectAwayOutDim(ctaLayout, outDimNames[order[1]]);
+  ctaLayout = actionRemoveBroadcastedRegs(ctaLayout).apply(ctaLayout);
+
+  LinearLayout finalLayout = tileLayout.transposeOuts(outDimNames) *
+                             ctaLayout.transposeOuts(outDimNames);
+  return combineCtaCgaWithShape(finalLayout, wmmaLayout.getCGALayout(), shape);
+}
+
 LinearLayout mfmaDotToLinearLayout(DotOperandEncodingAttr dotMfmaLayout,
                                    ArrayRef<int64_t> shape) {
   auto mfmaLayout = llvm::cast<AMDMfmaEncodingAttr>(dotMfmaLayout.getParent());
@@ -1378,8 +1453,13 @@ chooseDsReadTrLayout(Attribute enc, ArrayRef<int64_t> shape,
                      unsigned numLanesInShuffleGroup) {
   assert(elemBitWidth == 4);
   auto dot = cast<DotOperandEncodingAttr>(enc);
-  return chooseDotDsReadTrLayout(dot, shape, elemBitWidth, instBitWidth,
-                                 numLanesInShuffleGroup);
+  if (isa<AMDMfmaEncodingAttr>(dot.getParent()))
+    return chooseDotDsReadTrLayout(dot, shape, elemBitWidth, instBitWidth,
+                                   numLanesInShuffleGroup);
+  if (isa<AMDWmmaEncodingAttr>(dot.getParent()))
+    return chooseWmmaDotDsReadTrLayout(dot, shape, elemBitWidth, instBitWidth,
+                                       numLanesInShuffleGroup);
+  return std::nullopt;
 }
 
 LinearLayout chooseScaledWmmaScaleLayout(MLIRContext *ctx, int dotOperandIdx,

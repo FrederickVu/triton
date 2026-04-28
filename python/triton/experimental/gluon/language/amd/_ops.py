@@ -5,14 +5,70 @@ from triton.experimental.gluon.language import _core as ttgl
 from triton.experimental.gluon.language._semantic import _check
 
 from .._core import _unwrap_if_constexpr
-from .._layouts import DotOperandLayout
-from ._layouts import AMDWMMALayout
+from .._layouts import DotOperandLayout, SwizzledSharedLayout
+from ._layouts import AMDMFMALayout, AMDWMMALayout
 
 
 def _wrap_scaled_upcast_result(handle, elem_type, semantic):
     shape = semantic.builder.get_shape_from_tensor(handle)
     layout = semantic.builder.get_gluon_layout_from_tensor(handle)
     ret_ty = ttgl.distributed_type(elem_type, shape, layout)
+    return ttgl.tensor(handle, ret_ty)
+
+
+def _infer_packed_transposed_shape(src_shape, op_idx):
+    result_shape = src_shape.copy()
+    rank = len(src_shape)
+    if op_idx == 0:
+        packed_dim = 1 if rank == 3 else 0
+        k_dim = 2 if rank == 3 else 1
+        _check(src_shape[k_dim] % 2 == 0, lambda: f"Expected K dimension {src_shape[k_dim]} to be even")
+        result_shape[packed_dim] *= 2
+        result_shape[k_dim] //= 2
+    else:
+        k_dim = 1 if rank == 3 else 0
+        packed_dim = 2 if rank == 3 else 1
+        _check(src_shape[k_dim] % 2 == 0, lambda: f"Expected K dimension {src_shape[k_dim]} to be even")
+        result_shape[k_dim] //= 2
+        result_shape[packed_dim] *= 2
+    return result_shape
+
+
+def _local_load_packed_transposed(mem_desc, layout, shape, semantic, parent_types=(AMDMFMALayout, AMDWMMALayout)):
+    _check(isinstance(mem_desc, ttgl.shared_memory_descriptor),
+           lambda: f"Expected mem_desc to be a shared_memory_descriptor but got {type(mem_desc)}")
+    _check(isinstance(layout, DotOperandLayout),
+           lambda: f"Expected layout to be a DotOperandLayout but got {layout}")
+    _check(isinstance(layout.parent, parent_types),
+           lambda: f"Expected layout parent to be an instance of {parent_types} but got {layout.parent}")
+    _check(isinstance(mem_desc.type.layout, SwizzledSharedLayout),
+           lambda: f"Expected mem_desc layout to be a SwizzledSharedLayout but got {mem_desc.type.layout}")
+    _check(mem_desc.dtype in {ttgl.int8, ttgl.uint8},
+           lambda: f"Expected packed fp4 input in int8/uint8 but got {mem_desc.dtype}")
+
+    src_shape = list(mem_desc.shape)
+    rank = len(src_shape)
+    _check(rank in {2, 3}, lambda: f"Expected mem_desc rank to be 2 or 3 but got {rank}")
+    _check(layout.operand_index in {0, 1}, lambda: f"Expected operand_index to be 0 or 1 but got {layout.operand_index}")
+
+    expected_order = [0, 1] if layout.operand_index == 0 else [1, 0]
+    if rank == 3:
+        expected_order = [1, 2, 0] if layout.operand_index == 0 else [2, 1, 0]
+    _check(mem_desc.type.layout.order == expected_order,
+           lambda: f"Expected shared memory order {expected_order} but got {mem_desc.type.layout.order}")
+
+    inferred_shape = _infer_packed_transposed_shape(src_shape, layout.operand_index)
+    shape = _unwrap_if_constexpr(shape)
+    if shape is None:
+        result_shape = inferred_shape
+    else:
+        result_shape = list(shape)
+        _check(len(result_shape) == rank, lambda: f"Expected result shape rank {rank} but got {len(result_shape)}")
+        _check(result_shape == inferred_shape,
+               lambda: f"Expected result shape for local_load_packed_transposed to be {inferred_shape} but got {result_shape}")
+
+    ret_ty = ttgl.distributed_type(mem_desc.dtype, result_shape, layout)
+    handle = semantic.builder.create_local_load_packed_transposed(ret_ty.to_ir(semantic.builder), mem_desc.handle)
     return ttgl.tensor(handle, ret_ty)
 
 

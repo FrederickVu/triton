@@ -9,6 +9,7 @@
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
+#include "llvm/Support/MathExtras.h"
 
 using ::mlir::triton::gpu::MemDescType;
 
@@ -379,11 +380,6 @@ public:
     if (bitWidth != 8) {
       return failure();
     }
-    // FP4 packed along M/N are not supported yet on GFX1250
-    if (targetInfo.getISAFamily() == AMD::ISAFamily::GFX1250) {
-      return failure();
-    }
-
     return lowerSharedToDotOperandTransLL(op, adaptor, typeConverter, rewriter);
   }
 
@@ -401,6 +397,7 @@ private:
     auto srcTy = cast<MemDescType>(op.getSrc().getType());
     auto llvmElemTy = typeConverter->convertType(dstTy.getElementType());
     auto bitWidth = llvmElemTy.getIntOrFloatBitWidth();
+    auto kRegister = str_attr("register");
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                          llvmElemTy, rewriter);
     mlir::Type retTy = dstTy;
@@ -439,6 +436,11 @@ private:
     // Check that we will be able to vectorize the load.
     // Need to have exactly ldsTransLoadParams->tileSize,
     // otherwise we can't use ds_read_tr
+    auto originalCvt = cvt;
+    auto removeBroadcastedRegs = actionRemoveBroadcastedRegs(cvt);
+    if (!removeBroadcastedRegs.isIdentity())
+      cvt = removeBroadcastedRegs.apply(cvt);
+
     auto [elemsPerVec, permutation] =
         largestVectorisation(ctx, cvt, bitWidth, ldsTransLoadParams->tileSize);
 
@@ -456,8 +458,21 @@ private:
       assert(!ctaId.has_value() && "NYI");
       auto numElemsI32 = (vTy.getNumElements() * bitWidth / 32);
       auto vTyI32 = VectorType::get(numElemsI32, i32_ty);
-      Value dsReadTr =
-          ROCDL::ds_read_tr4_b64::create(rewriter, loc, vTyI32, vecAddr);
+      Value dsReadTr;
+      switch (targetInfo.getISAFamily()) {
+      case AMD::ISAFamily::GFX1250:
+        dsReadTr = LLVM::createLLVMIntrinsicCallOp(
+                       rewriter, loc, "llvm.amdgcn.ds.load.tr4.b64", {vTyI32},
+                       {vecAddr})
+                       .getResult(0);
+        break;
+      case AMD::ISAFamily::CDNA4:
+        dsReadTr =
+            ROCDL::ds_read_tr4_b64::create(rewriter, loc, vTyI32, vecAddr);
+        break;
+      default:
+        return {};
+      }
       Value vecVal = b.bitcast(dsReadTr, vTy);
       SmallVector<Value> loadedVals;
       for (int v = 0; v < vTy.getNumElements(); v++) {
@@ -473,6 +488,24 @@ private:
         llvmElemTy, smemObj.getBase(), paddingShifts, affineOffset,
         maskSpanAffineOffset, laneId, warpId, rewriter, targetInfo,
         ldsTransLoadParams->tileSize, lowerInst);
+    SmallVector<Value> loadedVals = outVals;
+
+    unsigned numElemsPerThread = triton::gpu::getTotalElemsPerThread(dstTy);
+    if (outVals.size() != numElemsPerThread &&
+        !removeBroadcastedRegs.isIdentity() &&
+        originalCvt.getInDimSize(kRegister) == numElemsPerThread) {
+      outVals = broadcastAs(outVals, originalCvt);
+    }
+
+    if (outVals.size() != numElemsPerThread) {
+      auto dstLL = triton::gpu::toLinearLayout(dstTy);
+      uint32_t broadcastMask = dstLL.getFreeVariableMasks().lookup(kRegister);
+      unsigned uniqueElemsPerThread =
+          dstLL.getInDimSize(kRegister) / (1u << llvm::popcount(broadcastMask));
+      if (loadedVals.size() == uniqueElemsPerThread)
+        outVals = broadcastAs(loadedVals, dstLL);
+    }
+
     Value result = packLLElements(loc, typeConverter, outVals, rewriter, retTy);
     rewriter.replaceOp(op, result);
     return success();
