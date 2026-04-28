@@ -141,8 +141,8 @@ def test_compile_gemm(a_dtype, b_dtype, k_dim, BLOCK_M, BLOCK_N, BLOCK_K):
 
 @gluon.jit
 def local_load_packed_transposed_kernel(in_ptr, out_ptr, SHARED_LAYOUT: ttgl.constexpr):
-    load_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [16, 2], [8, 1], [1, 0])
-    store_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [16, 2], [4, 2], [1, 0])
+    load_layout: ttgl.constexpr = ttgl.BlockedLayout([2, 16], [16, 2], [4, 1], [1, 0])
+    store_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 32], [16, 2], [4, 1], [1, 0])
     wmma_layout: ttgl.constexpr = ttgl.amd.AMDWMMALayout(3, False, [[0, 1], [1, 0]], [], [16, 16, 64])
     dot_layout: ttgl.constexpr = ttgl.DotOperandLayout(1, wmma_layout, 16)
 
@@ -172,9 +172,9 @@ def test_runtime_local_load_packed_transposed(shared_layout):
     expected = (logical[0::2, :] | (logical[1::2, :] << 4)).contiguous().view(torch.int8)
     out = torch.empty((64, 64), dtype=torch.int8, device="cuda")
 
-    pgm = local_load_packed_transposed_kernel[(1, )](inp.cuda(), out, shared_layout, num_warps=8)
+    pgm = local_load_packed_transposed_kernel[(1, )](inp.cuda(), out, shared_layout, num_warps=4)
 
-    assert "ds_read_tr4_b64" in pgm.asm["amdgcn"]
+    assert "ds_load_tr4_b64" in pgm.asm["amdgcn"]
     assert torch.equal(out.cpu(), expected)
 
 
