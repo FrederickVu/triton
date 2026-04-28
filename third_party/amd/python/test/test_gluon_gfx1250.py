@@ -139,6 +139,45 @@ def test_compile_gemm(a_dtype, b_dtype, k_dim, BLOCK_M, BLOCK_N, BLOCK_K):
     assert re.search(wmma_pattern, amdgcn)
 
 
+@gluon.jit
+def local_load_packed_transposed_kernel(in_ptr, out_ptr, SHARED_LAYOUT: ttgl.constexpr):
+    load_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [16, 2], [8, 1], [1, 0])
+    store_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 16], [16, 2], [4, 2], [1, 0])
+    wmma_layout: ttgl.constexpr = ttgl.amd.AMDWMMALayout(3, False, [[0, 1], [1, 0]], [], [16, 16, 64])
+    dot_layout: ttgl.constexpr = ttgl.DotOperandLayout(1, wmma_layout, 16)
+
+    offs_m = ttgl.arange(0, 128, layout=ttgl.SliceLayout(1, load_layout))
+    offs_n = ttgl.arange(0, 32, layout=ttgl.SliceLayout(0, load_layout))
+    x = ttgl.load(in_ptr + offs_m[:, None] * 32 + offs_n[None, :])
+
+    smem = ttgl.allocate_shared_memory(in_ptr.type.element_ty, [128, 32], SHARED_LAYOUT, x)
+    ttgl.barrier()
+
+    value = ttgl.amd.gfx1250.local_load_packed_transposed(smem, dot_layout)
+    value = ttgl.convert_layout(value, store_layout)
+    out_m = ttgl.arange(0, 64, layout=ttgl.SliceLayout(1, store_layout))
+    out_n = ttgl.arange(0, 64, layout=ttgl.SliceLayout(0, store_layout))
+    ttgl.store(out_ptr + out_m[:, None] * 64 + out_n[None, :], value)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
+@pytest.mark.parametrize("shared_layout", [
+    ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0]),
+    ttgl.SharedLinearLayout(
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0]], [], 16),
+], ids=["swizzled", "shared_linear"])
+def test_runtime_local_load_packed_transposed(shared_layout):
+    logical = (torch.arange(128, dtype=torch.uint8)[:, None] + 3 * torch.arange(64, dtype=torch.uint8)[None, :]) & 0xf
+    inp = (logical[:, 0::2] | (logical[:, 1::2] << 4)).contiguous().view(torch.int8)
+    expected = (logical[0::2, :] | (logical[1::2, :] << 4)).contiguous().view(torch.int8)
+    out = torch.empty((64, 64), dtype=torch.int8, device="cuda")
+
+    pgm = local_load_packed_transposed_kernel[(1, )](inp.cuda(), out, shared_layout, num_warps=8)
+
+    assert "ds_read_tr4_b64" in pgm.asm["amdgcn"]
+    assert torch.equal(out.cpu(), expected)
+
+
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
 def test_runtime_scaled_upcast_fp4():
 

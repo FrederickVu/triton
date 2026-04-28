@@ -12,9 +12,8 @@ from . import mbarrier
 from . import cluster
 
 __all__ = [
-    "async_copy", "tdm", "mbarrier", "cluster", "wmma", "wmma_scaled", "scaled_upcast",
-    "local_load_packed_transposed", "buffer_load", "buffer_store", "get_wmma_scale_layout",
-    "PartitionedSharedLayout"
+    "async_copy", "tdm", "mbarrier", "cluster", "wmma", "wmma_scaled", "scaled_upcast", "local_load_packed_transposed",
+    "buffer_load", "buffer_store", "get_wmma_scale_layout", "PartitionedSharedLayout"
 ]
 
 
@@ -128,7 +127,7 @@ def scaled_upcast(src, scale, elem_type, axis=None, _semantic=None):
 @builtin
 def local_load_packed_transposed(mem_desc, layout, shape=None, _semantic=None):
     """
-    Load M/N-packed fp4 bytes from shared memory into a K-packed WMMA dot operand layout.
+    Load M/N-packed fp4 bytes from swizzled or linear shared memory into a K-packed WMMA dot operand layout.
     """
     layout = _unwrap_if_constexpr(layout)
     shape = _unwrap_if_constexpr(shape)

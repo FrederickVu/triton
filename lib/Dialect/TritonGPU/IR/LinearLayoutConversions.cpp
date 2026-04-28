@@ -616,8 +616,7 @@ chooseWmmaDotDsReadTrLayout(DotOperandEncodingAttr dotWmmaLayout,
   // Each GFX1250 ds_load_tr4_b64 reads eight contiguous i8 values per lane.
   // Those are bytes along the non-K dimension before the instruction changes
   // the fp4 packing to the K dimension.
-  for (int32_t elem = 1; elem < static_cast<int32_t>(nonKDim / 2);
-       elem *= 2)
+  for (int32_t elem = 1; elem < static_cast<int32_t>(nonKDim / 2); elem *= 2)
     registerBase.push_back({elem, 0});
 
   registerBase.push_back({0, 16});

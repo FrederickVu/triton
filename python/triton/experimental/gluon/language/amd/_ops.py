@@ -5,7 +5,7 @@ from triton.experimental.gluon.language import _core as ttgl
 from triton.experimental.gluon.language._semantic import _check
 
 from .._core import _unwrap_if_constexpr
-from .._layouts import DotOperandLayout, SwizzledSharedLayout
+from .._layouts import DotOperandLayout, SharedLinearLayout, SwizzledSharedLayout
 from ._layouts import AMDMFMALayout, AMDWMMALayout
 
 
@@ -34,28 +34,46 @@ def _infer_packed_transposed_shape(src_shape, op_idx):
     return result_shape
 
 
+def _get_shared_layout_order(layout, rank):
+    if isinstance(layout, SwizzledSharedLayout):
+        return layout.order
+    if isinstance(layout, SharedLinearLayout):
+        order = []
+        for basis in layout.offset_bases:
+            dim = next((i for i, value in enumerate(basis) if value != 0), None)
+            if dim is not None and dim not in order:
+                order.append(dim)
+        for dim in reversed(range(rank)):
+            if dim not in order:
+                order.append(dim)
+        return order
+    raise AssertionError(f"Unsupported shared layout: {layout}")
+
+
 def _local_load_packed_transposed(mem_desc, layout, shape, semantic, parent_types=(AMDMFMALayout, AMDWMMALayout)):
     _check(isinstance(mem_desc, ttgl.shared_memory_descriptor),
            lambda: f"Expected mem_desc to be a shared_memory_descriptor but got {type(mem_desc)}")
-    _check(isinstance(layout, DotOperandLayout),
-           lambda: f"Expected layout to be a DotOperandLayout but got {layout}")
+    _check(isinstance(layout, DotOperandLayout), lambda: f"Expected layout to be a DotOperandLayout but got {layout}")
     _check(isinstance(layout.parent, parent_types),
            lambda: f"Expected layout parent to be an instance of {parent_types} but got {layout.parent}")
-    _check(isinstance(mem_desc.type.layout, SwizzledSharedLayout),
-           lambda: f"Expected mem_desc layout to be a SwizzledSharedLayout but got {mem_desc.type.layout}")
+    _check(
+        isinstance(mem_desc.type.layout, (SwizzledSharedLayout, SharedLinearLayout)), lambda:
+        f"Expected mem_desc layout to be a SwizzledSharedLayout or SharedLinearLayout but got {mem_desc.type.layout}")
     _check(mem_desc.dtype in {ttgl.int8, ttgl.uint8},
            lambda: f"Expected packed fp4 input in int8/uint8 but got {mem_desc.dtype}")
 
     src_shape = list(mem_desc.shape)
     rank = len(src_shape)
     _check(rank in {2, 3}, lambda: f"Expected mem_desc rank to be 2 or 3 but got {rank}")
-    _check(layout.operand_index in {0, 1}, lambda: f"Expected operand_index to be 0 or 1 but got {layout.operand_index}")
+    _check(layout.operand_index in {0, 1},
+           lambda: f"Expected operand_index to be 0 or 1 but got {layout.operand_index}")
 
     expected_order = [0, 1] if layout.operand_index == 0 else [1, 0]
     if rank == 3:
         expected_order = [1, 2, 0] if layout.operand_index == 0 else [2, 1, 0]
-    _check(mem_desc.type.layout.order == expected_order,
-           lambda: f"Expected shared memory order {expected_order} but got {mem_desc.type.layout.order}")
+    shared_order = _get_shared_layout_order(mem_desc.type.layout, rank)
+    _check(shared_order == expected_order,
+           lambda: f"Expected shared memory order {expected_order} but got {shared_order}")
 
     inferred_shape = _infer_packed_transposed_shape(src_shape, layout.operand_index)
     shape = _unwrap_if_constexpr(shape)
@@ -64,8 +82,9 @@ def _local_load_packed_transposed(mem_desc, layout, shape, semantic, parent_type
     else:
         result_shape = list(shape)
         _check(len(result_shape) == rank, lambda: f"Expected result shape rank {rank} but got {len(result_shape)}")
-        _check(result_shape == inferred_shape,
-               lambda: f"Expected result shape for local_load_packed_transposed to be {inferred_shape} but got {result_shape}")
+        _check(
+            result_shape == inferred_shape, lambda:
+            f"Expected result shape for local_load_packed_transposed to be {inferred_shape} but got {result_shape}")
 
     ret_ty = ttgl.distributed_type(mem_desc.dtype, result_shape, layout)
     handle = semantic.builder.create_local_load_packed_transposed(ret_ty.to_ir(semantic.builder), mem_desc.handle)

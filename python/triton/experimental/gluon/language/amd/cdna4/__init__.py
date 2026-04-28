@@ -11,8 +11,7 @@ from ..cdna3 import __all__ as __cdna3_all
 from . import async_copy
 
 __all__ = [
-    *__cdna3_all, "async_copy", "mfma_scaled", "scaled_upcast", "local_load_packed_transposed",
-    "get_mfma_scale_layout"
+    *__cdna3_all, "async_copy", "mfma_scaled", "scaled_upcast", "local_load_packed_transposed", "get_mfma_scale_layout"
 ]
 
 
@@ -78,7 +77,7 @@ def local_load_packed_transposed(mem_desc, layout, shape=None, _semantic=None):
     Load M/N-packed fp4 bytes from shared memory into a K-packed MFMA dot operand layout.
 
     The source shared memory descriptor must contain `int8` or `uint8` packed fp4
-    values in a `SwizzledSharedLayout`. If `shape` is not provided, the
+    values in a `SwizzledSharedLayout` or `SharedLinearLayout`. If `shape` is not provided, the
     destination shape is inferred from the source shape and dot operand index in
     `layout`.
     """

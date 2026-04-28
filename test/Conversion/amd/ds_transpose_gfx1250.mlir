@@ -8,6 +8,7 @@
 
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0, 1]}>
 #shared1 = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#shared_linear1 = #ttg.shared_linear<{offset = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0]], block = []}, alignment = 16>
 #padding = #ttg.padded_shared<[512:+16] {order = [0, 1], shape = [128, 64]}>
 #padding_vec1 = #ttg.padded_shared<[1:+4] {order = [0, 1], shape = [128, 64]}>
 #smem = #ttg.shared_memory
@@ -67,6 +68,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   tt.func @packed_transposed_fp4_wmma(%arg0: !ttg.memdesc<128x32xi8, #shared1, #smem, mutable>, %arg1: !tt.ptr<i8> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}) {
     // CHECK: llvm.call_intrinsic "llvm.amdgcn.ds.load.tr4.b64"(%{{.*}}) : (!llvm.ptr<3>) -> vector<2xi32>
     %1 = amdg.local_load_packed_transposed %arg0 : !ttg.memdesc<128x32xi8, #shared1, #smem, mutable> -> tensor<64x64xi8, #ttg.dot_op<{opIdx = 1, parent = #mma_b8, kWidth = 16}>>
+
+    %ptr1 = tt.splat %arg1 : !tt.ptr<i8> -> tensor<64x64x!tt.ptr<i8>, #ttg.dot_op<{opIdx = 1, parent = #mma_b8, kWidth = 16}>>
+    tt.store %ptr1, %1 : tensor<64x64x!tt.ptr<i8>, #ttg.dot_op<{opIdx = 1, parent = #mma_b8, kWidth = 16}>>
+    tt.return
+  }
+
+  //  CHECK-LABEL: packed_transposed_fp4_wmma_shared_linear
+  tt.func @packed_transposed_fp4_wmma_shared_linear(%arg0: !ttg.memdesc<128x32xi8, #shared_linear1, #smem, mutable>, %arg1: !tt.ptr<i8> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32}) {
+    // CHECK: llvm.call_intrinsic "llvm.amdgcn.ds.load.tr4.b64"(%{{.*}}) : (!llvm.ptr<3>) -> vector<2xi32>
+    %1 = amdg.local_load_packed_transposed %arg0 : !ttg.memdesc<128x32xi8, #shared_linear1, #smem, mutable> -> tensor<64x64xi8, #ttg.dot_op<{opIdx = 1, parent = #mma_b8, kWidth = 16}>>
 
     %ptr1 = tt.splat %arg1 : !tt.ptr<i8> -> tensor<64x64x!tt.ptr<i8>, #ttg.dot_op<{opIdx = 1, parent = #mma_b8, kWidth = 16}>>
     tt.store %ptr1, %1 : tensor<64x64x!tt.ptr<i8>, #ttg.dot_op<{opIdx = 1, parent = #mma_b8, kWidth = 16}>>

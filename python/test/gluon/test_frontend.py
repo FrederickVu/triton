@@ -2945,6 +2945,28 @@ def test_amd_local_load_packed_transposed_requires_inferred_shape(target):
     assert "Expected result shape for local_load_packed_transposed to be [64, 64] but got [128, 64]" in err
 
 
+@pytest.mark.parametrize("target", [HIP_TARGET_GFX1250])
+def test_amd_local_load_packed_transposed_accepts_shared_linear(target):
+
+    @gluon.jit
+    def kernel():
+        wmma_layout_packed: ttgl.constexpr = ttgl.amd.AMDWMMALayout(3, False, [[0, 1], [1, 0]], [], [16, 16, 64])
+        packed_rhs_layout: ttgl.constexpr = ttgl.DotOperandLayout(1, wmma_layout_packed, 16)
+        shared: ttgl.constexpr = ttgl.SharedLinearLayout(
+            [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0]], [],
+            16)
+
+        smem = ttgl.allocate_shared_memory(ttgl.uint8, [128, 32], shared)
+        value = ttgl.amd.gfx1250.local_load_packed_transposed(smem, packed_rhs_layout)
+        ttgl.static_assert(value.shape == [64, 64])
+
+    module = run_parser(kernel, *make_args(num_warps=4), target=target)
+    module_str = anonymize_ir(module.str_nodebug())
+    assert "#ttg.shared_linear" in module_str
+    assert "amdg.local_load_packed_transposed" in module_str
+    assert "tensor<64x64xi8" in module_str
+
+
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA3, HIP_TARGET_CDNA4], ids=["cdna3", "cdna4"])
 def test_amd_scaled_upcast_fp4_cdna(target):
     scaled_upcast = _get_amd_scaled_upcast(target)
