@@ -224,7 +224,6 @@ TargetInfo::queryLDSTransLoadParams(int bitWidth) const {
   if (version == NONE || !llvm::is_contained({16, 8, 4, 6}, bitWidth))
     return std::nullopt;
 
-  unsigned numLanesInShuffleGroup = getWarpSize() / 4;
   unsigned instBitWidth;
   bool doubleB8Contiguity;
 
@@ -241,6 +240,7 @@ TargetInfo::queryLDSTransLoadParams(int bitWidth) const {
     return std::nullopt;
   }
 
+  unsigned numLanesInShuffleGroup = 1024 / instBitWidth;
   unsigned tileSize = instBitWidth / bitWidth;
   return LDSTransLoadParams{numLanesInShuffleGroup, instBitWidth, tileSize,
                             doubleB8Contiguity};

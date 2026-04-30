@@ -575,9 +575,8 @@ chooseDotDsReadTrLayout(DotOperandEncodingAttr dotMfmaLayout,
 std::optional<LinearLayout>
 chooseWmmaDotDsReadTrLayout(DotOperandEncodingAttr dotWmmaLayout,
                             ArrayRef<int64_t> shape, int32_t elemBitWidth,
-                            unsigned instBitWidth,
-                            unsigned numLanesInShuffleGroup) {
-  if (instBitWidth != 64 || numLanesInShuffleGroup != 8)
+                            unsigned instBitWidth, unsigned transposeLanes) {
+  if (instBitWidth != 64 || transposeLanes != 16)
     return std::nullopt;
   auto wmmaLayout =
       llvm::dyn_cast<AMDWmmaEncodingAttr>(dotWmmaLayout.getParent());
@@ -597,13 +596,11 @@ chooseWmmaDotDsReadTrLayout(DotOperandEncodingAttr dotWmmaLayout,
 
   auto rank = shape.size();
   bool hasBatchDim = rank == 3;
-  auto kDim = opIdx == 0 ? rank - 1 : rank - 2;
-  int32_t kSize = shape[kDim];
 
   MLIRContext *ctx = dotWmmaLayout.getContext();
   SmallVector<StringAttr> outDimNames = standardOutDimNames(ctx, rank);
 
-  StringAttr kRegister = S("register");
+  StringAttr kRegDim = S("register");
   StringAttr kLane = S("lane");
 
   // The source is packed along the non-K dimension, so use [nonK, K] order.
@@ -613,27 +610,26 @@ chooseWmmaDotDsReadTrLayout(DotOperandEncodingAttr dotWmmaLayout,
   std::vector<std::vector<int32_t>> registerBase;
   std::vector<std::vector<int32_t>> laneBase;
 
-  // Each GFX1250 ds_load_tr4_b64 reads eight contiguous i8 values per lane.
-  // Those are bytes along the non-K dimension before the instruction changes
-  // the fp4 packing to the K dimension.
-  for (int32_t elem = 1; elem < static_cast<int32_t>(nonKDim / 2); elem *= 2)
-    registerBase.push_back({elem, 0});
+  registerBase.push_back({1, 0});
+  registerBase.push_back({2, 0});
+  registerBase.push_back({4, 0});
+  if (nonKDim == 32)
+    registerBase.push_back({8, 0});
 
   registerBase.push_back({0, 16});
-  for (int32_t reg = 64; reg < kSize; reg *= 2)
-    registerBase.push_back({0, reg});
+  registerBase.push_back({0, 64});
 
   laneBase.push_back({0, 1});
   laneBase.push_back({0, 2});
   laneBase.push_back({0, 4});
-  laneBase.push_back({0, 8});
   laneBase.push_back({0, 32});
+  laneBase.push_back({0, 8});
 
-  LinearLayout tileLayout({{kRegister, registerBase}, {kLane, laneBase}},
+  LinearLayout tileLayout({{kRegDim, registerBase}, {kLane, laneBase}},
                           {outDimNames[order[0]], outDimNames[order[1]]});
   if (hasBatchDim) {
     assert(order[2] == 0);
-    tileLayout *= LinearLayout::identity1D(1, kRegister, outDimNames[order[2]]);
+    tileLayout *= LinearLayout::identity1D(1, kRegDim, outDimNames[order[2]]);
     tileLayout *= LinearLayout::identity1D(1, kLane, outDimNames[order[2]]);
   }
 

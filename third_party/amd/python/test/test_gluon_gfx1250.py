@@ -167,7 +167,8 @@ def local_load_packed_transposed_kernel(in_ptr, out_ptr, SHARED_LAYOUT: ttgl.con
         [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0]], [], 16),
 ], ids=["swizzled", "shared_linear"])
 def test_runtime_local_load_packed_transposed(shared_layout):
-    logical = (torch.arange(128, dtype=torch.uint8)[:, None] + 3 * torch.arange(64, dtype=torch.uint8)[None, :]) & 0xf
+    torch.manual_seed(0)
+    logical = torch.randint(0, 16, (128, 64), dtype=torch.uint8)
     inp = (logical[:, 0::2] | (logical[:, 1::2] << 4)).contiguous().view(torch.int8)
     expected = (logical[0::2, :] | (logical[1::2, :] << 4)).contiguous().view(torch.int8)
     out = torch.empty((64, 64), dtype=torch.int8, device="cuda")
